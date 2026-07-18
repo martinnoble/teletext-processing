@@ -26,6 +26,13 @@ Options:
     --page PAGE         Only stream packets for this page number (e.g. 172, 1BA).
                         Implies --magazine is set to the magazine of that page if
                         --magazine is not supplied explicitly.
+    --interleave        Re-order the output stream so that pages from different
+                        magazines are interleaved round-robin rather than output
+                        in the order they appear in the file.  Each complete page
+                        (header packet + all following row packets up to the next
+                        header) is treated as one unit.  Compatible with --loop;
+                        incompatible with --magazine / --page filters (those
+                        options are ignored when --interleave is set).
 """
 
 import sys
@@ -72,6 +79,35 @@ def _parse_page_hex(packet_data, magazine):
     return f"{magazine:X}{page_tens:X}{page_units:X}"
 
 
+def _parse_page_sort_key(header_packet):
+    """
+    Return a sort key (page_tens, page_units, subcode) for a header packet,
+    used to order pages within a magazine by page number then sub-page.
+
+    Sub-code is assembled from bytes 4-9 per ETS 300 706 §9.3.1.2:
+      byte 4  → S1 (bits 0-3)
+      byte 5  → S2 (bits 0-2) + C4 (bit 3, ignored)
+      byte 6  → S3 (bits 0-3)
+      byte 7  → S4 (bits 0-1) + C5-C6 (bits 2-3, ignored)
+
+    Returns (page_tens, page_units, subcode); undecodable fields are
+    replaced with 0 so the page still sorts stably.
+    """
+    page_units = hamming_8_4_decode(header_packet[2]) or 0
+    page_tens  = hamming_8_4_decode(header_packet[3]) or 0
+    s1 = hamming_8_4_decode(header_packet[4]) or 0
+    s2 = hamming_8_4_decode(header_packet[5]) or 0
+    s3 = hamming_8_4_decode(header_packet[6]) or 0
+    s4 = hamming_8_4_decode(header_packet[7]) or 0
+    subcode = (
+        (s1 & 0x0F) |
+        ((s2 & 0x07) << 4) |
+        ((s3 & 0x0F) << 7) |
+        ((s4 & 0x03) << 11)
+    )
+    return (page_tens, page_units, subcode)
+
+
 def _apply_time_to_header(packet_data, mask, time_format):
     """
     Return a modified copy of *packet_data* with the '#'-masked header
@@ -109,8 +145,78 @@ def _apply_time_to_header(packet_data, mask, time_format):
     return bytes(packet)
 
 
+def _read_pages_by_magazine(input_file):
+    """
+    Scan *input_file* and return a dict mapping magazine number (1-8) to a
+    list of pages, where each page is a list of raw 42-byte packet bytestrings.
+
+    A page starts with a packet_number==0 (header) packet and ends just before
+    the next header packet for the same magazine, or at EOF.  Packets whose
+    address cannot be decoded are discarded.
+    """
+    pages_by_mag = {}  # mag -> list of pages; each page is list[bytes]
+
+    # current_page[mag] holds the packets accumulated for the in-progress page
+    current_page = {}
+
+    with open(input_file, 'rb') as f:
+        while True:
+            packet = f.read(PACKET_SIZE)
+            if len(packet) < PACKET_SIZE:
+                break
+
+            magazine, packet_number = _parse_packet_address(packet)
+            if magazine is None:
+                continue
+
+            if packet_number == 0:
+                # Flush any in-progress page for this magazine
+                if magazine in current_page and current_page[magazine]:
+                    pages_by_mag.setdefault(magazine, []).append(current_page[magazine])
+                current_page[magazine] = [packet]
+            else:
+                if magazine in current_page:
+                    current_page[magazine].append(packet)
+                # Packets arriving before the first header for a magazine are dropped
+
+    # Flush remaining in-progress pages at EOF
+    for mag, page in current_page.items():
+        if page:
+            pages_by_mag.setdefault(mag, []).append(page)
+
+    # Sort pages within each magazine by page number then sub-page
+    for mag in pages_by_mag:
+        pages_by_mag[mag].sort(key=lambda page: _parse_page_sort_key(page[0]))
+
+    return pages_by_mag
+
+
+def _interleave_pages(pages_by_mag):
+    """
+    Given a dict of {magazine: [page, ...]}, yield pages in round-robin order
+    across magazines (sorted by magazine number), cycling until all magazines
+    are exhausted.
+
+    Each yielded value is a list[bytes] representing one complete page.
+    """
+    # Work with sorted magazine order for deterministic output
+    magazines = sorted(pages_by_mag.keys())
+    iterators = {mag: iter(pages_by_mag[mag]) for mag in magazines}
+    active = list(magazines)
+
+    while active:
+        next_active = []
+        for mag in active:
+            try:
+                yield next(iterators[mag])
+                next_active.append(mag)
+            except StopIteration:
+                pass  # This magazine is exhausted
+        active = next_active
+
+
 def restream(input_file, mask, time_format, loop, output=None,
-             filter_magazine=None, filter_page=None):
+             filter_magazine=None, filter_page=None, interleave=False):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -125,6 +231,8 @@ def restream(input_file, mask, time_format, loop, output=None,
         output: writable binary stream; defaults to sys.stdout.buffer
         filter_magazine: if not None, only emit packets from this magazine (1-8)
         filter_page: if not None, only emit packets for this page (e.g. '172')
+        interleave: if True, re-order the stream so pages from different
+                    magazines are interleaved round-robin
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -133,6 +241,10 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if output is None:
         output = sys.stdout.buffer
+
+    if interleave:
+        _restream_interleaved(input_file, mask, time_format, loop, output)
+        return
 
     # Normalise filter_page to uppercase for comparison
     filter_page_upper = filter_page.upper() if filter_page is not None else None
@@ -206,6 +318,34 @@ def restream(input_file, mask, time_format, loop, output=None,
             output.flush()
 
 
+def _restream_interleaved(input_file, mask, time_format, loop, output):
+    """
+    Emit packets from *input_file* interleaved round-robin by magazine.
+
+    On each pass through the file all pages are bucketed by magazine; pages
+    are then emitted one-at-a-time cycling through magazines in sorted order.
+    When *loop* is True this repeats indefinitely.
+    """
+    while True:
+        pages_by_mag = _read_pages_by_magazine(input_file)
+        if not pages_by_mag:
+            if not loop:
+                break
+            continue
+
+        for page_packets in _interleave_pages(pages_by_mag):
+            # page_packets[0] is always the header packet
+            header = _apply_time_to_header(page_packets[0], mask, time_format)
+            output.write(header)
+            output.flush()
+            for pkt in page_packets[1:]:
+                output.write(pkt)
+                output.flush()
+
+        if not loop:
+            break
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -217,6 +357,7 @@ def main():
     loop = False
     filter_magazine = None
     filter_page = None
+    interleave = False
 
     i = 2
     while i < len(sys.argv):
@@ -255,6 +396,9 @@ def main():
                 sys.exit(1)
             filter_page = sys.argv[i + 1]
             i += 2
+        elif arg == "--interleave":
+            interleave = True
+            i += 1
         else:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
             sys.exit(1)
@@ -265,7 +409,8 @@ def main():
 
     try:
         restream(input_file, mask, time_format, loop,
-                 filter_magazine=filter_magazine, filter_page=filter_page)
+                 filter_magazine=filter_magazine, filter_page=filter_page,
+                 interleave=interleave)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
