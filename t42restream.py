@@ -184,9 +184,11 @@ def _read_pages_by_magazine(input_file):
         if page:
             pages_by_mag.setdefault(mag, []).append(page)
 
-    # Sort pages within each magazine by page number then sub-page
+    # Sort pages within each magazine by page number.  Pages with the same base
+    # page number (tens, units) preserve their original file order relative to
+    # each other (stable sort), so duplicate sub-page sequences stay intact.
     for mag in pages_by_mag:
-        pages_by_mag[mag].sort(key=lambda page: _parse_page_sort_key(page[0]))
+        pages_by_mag[mag].sort(key=lambda page: _parse_page_sort_key(page[0])[:2])
 
     return pages_by_mag
 
