@@ -126,6 +126,120 @@ def decode_page_header(packet_data):
     return page_units, page_tens, subcode, control_bits, header_text
 
 
+def decode_packet_27(packet_data, magazine):
+    """
+    Decode a Packet X/27/0-3 (editorial page linking) per ETS 300 706 §9.6.1.
+
+    T42 byte indices (0-41 in a 42-byte packet) map to spec bytes as:
+      index = spec_byte - 4   (spec bytes 4-5 are the 2-byte packet address at indices 0-1)
+
+    Structure:
+      Index 2  (spec byte 6)  : Designation code, Hamming 8/4 coded (0-3 editorial, 4-7 compositional)
+      Indices 3-38 (spec bytes 7-42): 6 link groups × 6 bytes, all Hamming 8/4 coded.
+        Each group mirrors bytes 6-11 of a page header (§9.3.1):
+          +0 : page units           (bits 0-3)
+          +1 : page tens            (bits 0-3)
+          +2 : sub-code S1          (bits 0-3)
+          +3 : sub-code S2 + M1     (bits 0-2 = S2, bit 3 = M1)
+          +4 : sub-code S3          (bits 0-3)
+          +5 : sub-code S4 + M2,M3  (bits 0-1 = S4, bit 2 = M2, bit 3 = M3)
+      Index 39 (spec byte 43) : Link Control Byte, Hamming 8/4 (X/27/0 only)
+        bit 3 of decoded nibble = show row 24 flag
+      Indices 40-41 (spec bytes 44-45): CRC, raw 8-bit data (X/27/0 only)
+        byte 44 = CRC bits 9-16, byte 45 = CRC bits 1-8
+
+    Args:
+        packet_data: bytes — 42-byte T42 packet starting at the packet address bytes
+        magazine: int — magazine number (1-8) from the packet address, used as the
+                  base for the relative magazine XOR (M1/M2/M3 bits)
+
+    Returns:
+        dict with keys:
+          'designation_code': int
+          'links': list of 6 dicts, each with:
+              'page'    : str  — full page identifier e.g. "172", or None if undecodable
+              'subcode' : int  — 13-bit sub-code, or None
+              'no_page' : bool — True when the address is XFF:3F7F (no page specified)
+          'link_control' : int or None — decoded LC nibble (X/27/0 only)
+          'show_row_24'  : bool or None — whether row 24 data should be displayed (X/27/0 only)
+          'crc'          : int or None  — 16-bit page CRC (X/27/0 only)
+    """
+    if len(packet_data) < 42:
+        return None
+
+    # Index 2 = spec byte 6 = designation code
+    desig_raw = hamming_8_4_decode(packet_data[2])
+    if desig_raw is None:
+        return None
+    designation_code = desig_raw & 0x0F
+
+    links = []
+    # Six link groups, each 6 bytes, starting at index 3 (spec byte 7)
+    for n in range(6):
+        base = 3 + n * 6
+
+        pu_raw = hamming_8_4_decode(packet_data[base + 0])  # page units
+        pt_raw = hamming_8_4_decode(packet_data[base + 1])  # page tens
+        s1_raw = hamming_8_4_decode(packet_data[base + 2])  # S1
+        s2_raw = hamming_8_4_decode(packet_data[base + 3])  # S2 + M1
+        s3_raw = hamming_8_4_decode(packet_data[base + 4])  # S3
+        s4_raw = hamming_8_4_decode(packet_data[base + 5])  # S4 + M2 + M3
+
+        if any(v is None for v in (pu_raw, pt_raw, s1_raw, s2_raw, s3_raw, s4_raw)):
+            links.append({'page': None, 'subcode': None, 'no_page': False})
+            continue
+
+        page_units = pu_raw & 0x0F
+        page_tens  = pt_raw & 0x0F
+
+        # M1/M2/M3 XOR the packet's own magazine number to derive the link's magazine
+        m1 = (s2_raw >> 3) & 1   # bit 3 of the S2 byte (same position as C4 in page header)
+        m2 = (s4_raw >> 2) & 1   # bit 2 of the S4 byte (same position as C5 in page header)
+        m3 = (s4_raw >> 3) & 1   # bit 3 of the S4 byte (same position as C6 in page header)
+        link_mag = magazine ^ (m1 | (m2 << 1) | (m3 << 2))
+        if link_mag == 0:
+            link_mag = 8
+
+        # Assemble 13-bit sub-code: S1 (bits 0-3), S2 (bits 4-6), S3 (bits 7-10), S4 (bits 11-12)
+        s1 = s1_raw & 0x0F
+        s2 = s2_raw & 0x07
+        s3 = s3_raw & 0x0F
+        s4 = s4_raw & 0x03
+        subcode = s1 | (s2 << 4) | (s3 << 7) | (s4 << 11)
+
+        # Address XFF:3F7F means "no page specified"
+        no_page = (page_units == 0xF and page_tens == 0xF and subcode == 0x1F7F)
+
+        links.append({
+            'page': f"{link_mag:X}{page_tens:X}{page_units:X}",
+            'subcode': subcode,
+            'no_page': no_page,
+        })
+
+    # Bytes 43-45 (indices 39-41) are only defined for X/27/0
+    link_control = None
+    show_row_24 = None
+    crc = None
+
+    if designation_code == 0:
+        # Index 39 = spec byte 43 = Link Control Byte (Hamming 8/4)
+        lc_raw = hamming_8_4_decode(packet_data[39])
+        if lc_raw is not None:
+            link_control = lc_raw & 0x0F
+            show_row_24 = bool((link_control >> 3) & 1)
+        # Indices 40-41 = spec bytes 44-45 = CRC (raw 8-bit, not Hamming coded)
+        # Spec: byte 44 = CRC bits 9-16, byte 45 = CRC bits 1-8
+        crc = (packet_data[40] << 8) | packet_data[41]
+
+    return {
+        'designation_code': designation_code,
+        'links': links,
+        'link_control': link_control,
+        'show_row_24': show_row_24,
+        'crc': crc,
+    }
+
+
 def decode_data_packet(packet_data):
     """
     Decode a data packet (packets 1-24) to extract text content.
@@ -371,6 +485,29 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
                                     text = decode_data_packet(packet)
                                     if text:
                                         print(f"[{packet_number:02d}]: {text}")
+                                elif packet_number == 27:
+                                    # Editorial / compositional page linking packet
+                                    p27 = decode_packet_27(packet, magazine)
+                                    if p27 is not None:
+                                        dc = p27['designation_code']
+                                        print(f"Packet {packet_count}: Magazine {magazine}, Packet 27/{dc} (Page Links)")
+                                        link_names = ["Red", "Green", "Yellow", "Cyan", "Index", "Next"]
+                                        for i, link in enumerate(p27['links']):
+                                            name = link_names[i] if i < len(link_names) else f"Link {i}"
+                                            if link['page'] is None:
+                                                print(f"  {name}: [decode error]")
+                                            elif link['no_page']:
+                                                print(f"  {name}: (none)")
+                                            else:
+                                                sc_str = f":{link['subcode']:04X}" if link['subcode'] is not None else ""
+                                                print(f"  {name}: {link['page']}{sc_str}")
+                                        if dc == 0:
+                                            row24_str = "yes" if p27['show_row_24'] else "no"
+                                            print(f"  Show row 24: {row24_str}")
+                                            if p27['crc'] is not None:
+                                                print(f"  CRC: 0x{p27['crc']:04X}")
+                                    else:
+                                        print(f"Packet {packet_count}: Magazine {magazine}, Packet {packet_number} (decode error)")
                                 else:
                                     print(f"Packet {packet_count}: Magazine {magazine}, Packet {packet_number}")
                                 filtered_count += 1

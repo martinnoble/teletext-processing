@@ -22,6 +22,10 @@ Options:
                         long as the number of '#' characters in the mask.
                         Default: "%H:%M:%S"
     --loop              Loop through the file indefinitely (streams continuously).
+    --magazine MAG      Only stream packets from this magazine number (1-8).
+    --page PAGE         Only stream packets for this page number (e.g. 172, 1BA).
+                        Implies --magazine is set to the magazine of that page if
+                        --magazine is not supplied explicitly.
 """
 
 import sys
@@ -53,6 +57,19 @@ def _parse_packet_address(packet_data):
         magazine = 8
     packet_number = (combined >> 3) & 0x1F
     return magazine, packet_number
+
+
+def _parse_page_hex(packet_data, magazine):
+    """
+    Return the page identifier string (e.g. '172') for a header packet,
+    or None if the page bytes cannot be decoded.
+    Requires packet_data to be a full PACKET_SIZE-byte header packet.
+    """
+    page_units = hamming_8_4_decode(packet_data[2])
+    page_tens = hamming_8_4_decode(packet_data[3])
+    if page_units is None or page_tens is None:
+        return None
+    return f"{magazine:X}{page_tens:X}{page_units:X}"
 
 
 def _apply_time_to_header(packet_data, mask, time_format):
@@ -92,7 +109,8 @@ def _apply_time_to_header(packet_data, mask, time_format):
     return bytes(packet)
 
 
-def restream(input_file, mask, time_format, loop, output=None):
+def restream(input_file, mask, time_format, loop, output=None,
+             filter_magazine=None, filter_page=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -105,6 +123,8 @@ def restream(input_file, mask, time_format, loop, output=None):
         time_format: strftime format string
         loop: if True, seek back to the start of the file after reaching EOF
         output: writable binary stream; defaults to sys.stdout.buffer
+        filter_magazine: if not None, only emit packets from this magazine (1-8)
+        filter_page: if not None, only emit packets for this page (e.g. '172')
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -114,6 +134,21 @@ def restream(input_file, mask, time_format, loop, output=None):
     if output is None:
         output = sys.stdout.buffer
 
+    # Normalise filter_page to uppercase for comparison
+    filter_page_upper = filter_page.upper() if filter_page is not None else None
+
+    # When filtering by page, derive the magazine from the page prefix so that
+    # inter-magazine packets are also suppressed correctly.
+    if filter_page_upper is not None and filter_magazine is None:
+        try:
+            filter_magazine = int(filter_page_upper[0], 16)
+            if filter_magazine == 0:
+                filter_magazine = 8
+        except (ValueError, IndexError):
+            pass
+
+    current_page_matches = True  # True when no page filter is active
+
     with open(input_file, 'rb') as f:
         while True:
             packet = f.read(PACKET_SIZE)
@@ -121,6 +156,7 @@ def restream(input_file, mask, time_format, loop, output=None):
             if len(packet) == 0:
                 if loop:
                     f.seek(0)
+                    current_page_matches = filter_page_upper is None
                     continue
                 break
 
@@ -128,14 +164,43 @@ def restream(input_file, mask, time_format, loop, output=None):
                 # Incomplete trailing packet — skip and optionally loop
                 if loop:
                     f.seek(0)
+                    current_page_matches = filter_page_upper is None
                     continue
                 break
 
             magazine, packet_number = _parse_packet_address(packet)
 
-            if magazine is not None and packet_number == 0:
-                # This is a page header packet — inject the current time
-                packet = _apply_time_to_header(packet, mask, time_format)
+            if magazine is None:
+                # Undecodable address — drop when any filter is active
+                if filter_magazine is None and filter_page_upper is None:
+                    output.write(packet)
+                    output.flush()
+                continue
+
+            # Magazine filter
+            if filter_magazine is not None and magazine != filter_magazine:
+                if packet_number == 0:
+                    current_page_matches = False
+                continue
+
+            if packet_number == 0:
+                # Header packet — determine whether this page passes the filter
+                if filter_page_upper is not None:
+                    page_hex = _parse_page_hex(packet, magazine)
+                    current_page_matches = (page_hex == filter_page_upper)
+                else:
+                    current_page_matches = True
+
+                if current_page_matches:
+                    # Inject current time into header
+                    packet = _apply_time_to_header(packet, mask, time_format)
+                else:
+                    #ensure we don't output non matching header packets
+                    continue
+            else:
+                # Non-header packet — emit only if we are inside a matching page
+                if not current_page_matches:
+                    continue
 
             output.write(packet)
             output.flush()
@@ -150,6 +215,8 @@ def main():
     mask = DEFAULT_MASK
     time_format = DEFAULT_TIME_FORMAT
     loop = False
+    filter_magazine = None
+    filter_page = None
 
     i = 2
     while i < len(sys.argv):
@@ -169,6 +236,25 @@ def main():
         elif arg == "--loop":
             loop = True
             i += 1
+        elif arg == "--magazine":
+            if i + 1 >= len(sys.argv):
+                print("Error: --magazine requires an argument", file=sys.stderr)
+                sys.exit(1)
+            try:
+                filter_magazine = int(sys.argv[i + 1])
+                if filter_magazine < 1 or filter_magazine > 8:
+                    print("Error: Magazine number must be between 1 and 8", file=sys.stderr)
+                    sys.exit(1)
+            except ValueError:
+                print("Error: --magazine argument must be an integer", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+        elif arg == "--page":
+            if i + 1 >= len(sys.argv):
+                print("Error: --page requires an argument", file=sys.stderr)
+                sys.exit(1)
+            filter_page = sys.argv[i + 1]
+            i += 2
         else:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
             sys.exit(1)
@@ -178,7 +264,8 @@ def main():
         sys.exit(1)
 
     try:
-        restream(input_file, mask, time_format, loop)
+        restream(input_file, mask, time_format, loop,
+                 filter_magazine=filter_magazine, filter_page=filter_page)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
