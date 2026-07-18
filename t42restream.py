@@ -193,26 +193,57 @@ def _read_pages_by_magazine(input_file):
 
 def _interleave_pages(pages_by_mag):
     """
-    Given a dict of {magazine: [page, ...]}, yield pages in round-robin order
-    across magazines (sorted by magazine number), cycling until all magazines
-    are exhausted.
+    Given a dict of {magazine: [page, ...]}, yield pages interleaved so that
+    sub-pages are stepped through one at a time, with magazines interleaved
+    round-robin on every step.
+
+    For example, with pages 100 (3 sub-pages), 200 (2 sub-pages), 300 (1
+    sub-page) the output order is:
+        100/0001, 200/0001, 300/0001,
+        100/0002, 200/0002, 300/0001,   ← 300 wraps back to its only sub-page
+        100/0003, 200/0001, 300/0001    ← 200 wraps back too
+
+    Pages within each magazine are grouped by base page number (tens, units).
+    All base-page slots across all magazines are collected into a flat ordered
+    list; on each sub-page step every slot yields sub-page index N % len(slot).
+    The outer loop runs max_subpages times (the maximum sub-page count of any
+    single base page).
 
     Each yielded value is a list[bytes] representing one complete page.
     """
-    # Work with sorted magazine order for deterministic output
     magazines = sorted(pages_by_mag.keys())
-    iterators = {mag: iter(pages_by_mag[mag]) for mag in magazines}
-    active = list(magazines)
 
-    while active:
-        next_active = []
-        for mag in active:
-            try:
-                yield next(iterators[mag])
-                next_active.append(mag)
-            except StopIteration:
-                pass  # This magazine is exhausted
-        active = next_active
+    # Group each magazine's pages into per-base-page sub-page lists.
+    # slots_by_mag[mag] = [ [100/0001, 100/0002], [101/0001], ... ]
+    slots_by_mag = {}
+    for mag in magazines:
+        seen = {}       # (tens, units) -> index in this magazine's slot list
+        mag_slots = []
+        for page in pages_by_mag[mag]:
+            key = _parse_page_sort_key(page[0])[:2]  # (tens, units)
+            if key not in seen:
+                seen[key] = len(mag_slots)
+                mag_slots.append([])
+            mag_slots[seen[key]].append(page)
+        slots_by_mag[mag] = mag_slots
+
+    # Interleave slot lists across magazines: take slot 0 from each mag, then
+    # slot 1 from each mag, etc.  This gives the desired order:
+    #   mag1/page0, mag2/page0, mag3/page0,
+    #   mag1/page1, mag2/page1, mag3/page1, ...
+    max_pages_per_mag = max(len(slots_by_mag[mag]) for mag in magazines)
+    slots = []
+    for page_idx in range(max_pages_per_mag):
+        for mag in magazines:
+            mag_slots = slots_by_mag[mag]
+            if page_idx < len(mag_slots):
+                slots.append(mag_slots[page_idx])
+
+    max_subpages = max(len(slot) for slot in slots)
+
+    for subpage_idx in range(max_subpages):
+        for slot in slots:
+            yield slot[subpage_idx % len(slot)]
 
 
 def restream(input_file, mask, time_format, loop, output=None,
