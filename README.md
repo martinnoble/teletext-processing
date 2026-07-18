@@ -1,3 +1,9 @@
+
+# Useful resources
+
+T42 archive: https://computer-legacy.com/teletext.html
+
+
 # T42 Teletext Parser
 
 A Python library for processing T42 Teletext packet streams with Hamming 8/4 error correction.
