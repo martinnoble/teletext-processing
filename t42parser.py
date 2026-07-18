@@ -404,10 +404,102 @@ def analyze_page_statistics(filename, only_deviations=False):
         print(f"Error processing file: {e}")
 
 
+def _describe_packet(packet, packet_pos, magazine, packet_number,
+                     decode_data, page_appearance_counts, current_page_matches,
+                     filter_magazine, filter_page, page_hex_ref):
+    """
+    Return a list of output lines describing *packet*, with each line already
+    prefixed by ``<packet_pos>``.  Also updates *page_appearance_counts* in-place
+    and returns the updated (current_page_matches, page_hex) as a 2-tuple via the
+    last element of the returned list being a sentinel tuple — callers unpack:
+
+        lines, current_page_matches, page_hex = _describe_packet(...)
+
+    page_hex_ref is the current page_hex passed in so non-header packets can
+    reference it.
+
+    Returns (lines, new_current_page_matches, new_page_hex).
+    """
+    pos = f"<{packet_pos}>"
+    lines = []
+    new_page_hex = page_hex_ref
+
+    if magazine is None or packet_number is None:
+        if filter_magazine is None:
+            lines.append(f"{pos} Error decoding header")
+        return lines, current_page_matches, new_page_hex
+
+    if packet_number == 0:
+        page_units, page_tens, subcode, control_bits, header_text = decode_page_header(packet)
+        if page_units is not None and page_tens is not None:
+            new_page_hex = f"{magazine:X}{page_tens:X}{page_units:X}"
+
+            if new_page_hex not in page_appearance_counts:
+                page_appearance_counts[new_page_hex] = 0
+            page_appearance_counts[new_page_hex] += 1
+            appearance_num = page_appearance_counts[new_page_hex]
+
+            page_matches = True
+            if filter_magazine is not None and magazine != filter_magazine:
+                page_matches = False
+            if filter_page is not None and new_page_hex != filter_page.upper():
+                page_matches = False
+
+            if page_matches:
+                subcode_str = f".{subcode:04X}" if subcode is not None else ""
+                lines.append(f"{pos} Magazine {magazine}, Packet {packet_number} (Header) - Page {new_page_hex}{subcode_str} [#{appearance_num}]")
+                if header_text:
+                    lines.append(f"{pos}   Header: {header_text}")
+                if control_bits:
+                    active_controls = [name for name, value in control_bits.items() if value == 1]
+                    if active_controls:
+                        lines.append(f"{pos}   Control: {', '.join(active_controls)}")
+
+            return lines, page_matches, new_page_hex
+        else:
+            return lines, False, new_page_hex
+    else:
+        if not current_page_matches:
+            return lines, current_page_matches, new_page_hex
+        if filter_magazine is not None and magazine != filter_magazine:
+            return lines, current_page_matches, new_page_hex
+
+        if decode_data and 1 <= packet_number <= 24:
+            text = decode_data_packet(packet)
+            if text:
+                lines.append(f"{pos} [{packet_number:02d}]: {text}")
+        elif packet_number == 27:
+            p27 = decode_packet_27(packet, magazine)
+            if p27 is not None:
+                dc = p27['designation_code']
+                lines.append(f"{pos} Magazine {magazine}, Packet 27/{dc} (Page Links)")
+                link_names = ["Red", "Green", "Yellow", "Cyan", "Index", "Next"]
+                for i, link in enumerate(p27['links']):
+                    name = link_names[i] if i < len(link_names) else f"Link {i}"
+                    if link['page'] is None:
+                        lines.append(f"{pos}   {name}: [decode error]")
+                    elif link['no_page']:
+                        lines.append(f"{pos}   {name}: (none)")
+                    else:
+                        sc_str = f":{link['subcode']:04X}" if link['subcode'] is not None else ""
+                        lines.append(f"{pos}   {name}: {link['page']}{sc_str}")
+                if dc == 0:
+                    row24_str = "yes" if p27['show_row_24'] else "no"
+                    lines.append(f"{pos}   Show row 24: {row24_str}")
+                    if p27['crc'] is not None:
+                        lines.append(f"{pos}   CRC: 0x{p27['crc']:04X}")
+            else:
+                lines.append(f"{pos} Magazine {magazine}, Packet {packet_number} (decode error)")
+        else:
+            lines.append(f"{pos} Magazine {magazine}, Packet {packet_number}")
+
+        return lines, current_page_matches, new_page_hex
+
+
 def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_page=None):
     """
     Process a T42 binary file and extract packet information.
-    
+
     Args:
         filename: path to the binary file containing T42 packets
         filter_magazine: if specified, only show packets from this magazine number
@@ -417,108 +509,127 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
     packet_size = 42
     packet_count = 0
     filtered_count = 0
-    current_page_matches = False  # Track if we're in a matching page
-    page_appearance_counts = {}  # Track how many times each page has appeared
-    
+    current_page_matches = False
+    current_page_hex = None
+    page_appearance_counts = {}
+
     try:
         with open(filename, 'rb') as f:
             while True:
-                # Read one packet (42 bytes)
                 packet = f.read(packet_size)
-                
+
                 if len(packet) == 0:
-                    break  # End of file
-                
+                    break
+
                 if len(packet) < packet_size:
                     print(f"Warning: Incomplete packet at end of file ({len(packet)} bytes)")
                     break
-                
+
                 packet_count += 1
-                
-                # Parse the packet header
                 magazine, packet_number = parse_packet_header(packet)
-                
-                if magazine is not None and packet_number is not None:
-                    # Check if this is a header packet (packet 0)
-                    if packet_number == 0:
-                        page_units, page_tens, subcode, control_bits, header_text = decode_page_header(packet)
-                        if page_units is not None and page_tens is not None:
-                            # Page number is in hex format
-                            page_hex = f"{magazine:X}{page_tens:X}{page_units:X}"
-                            
-                            # Increment appearance counter for this page
-                            if page_hex not in page_appearance_counts:
-                                page_appearance_counts[page_hex] = 0
-                            page_appearance_counts[page_hex] += 1
-                            appearance_num = page_appearance_counts[page_hex]
-                            
-                            # Check if this page matches our filters
-                            page_matches = True
-                            if filter_magazine is not None and magazine != filter_magazine:
-                                page_matches = False
-                            if filter_page is not None and page_hex != filter_page.upper():
-                                page_matches = False
-                            
-                            current_page_matches = page_matches
-                            
-                            if page_matches:
-                                subcode_str = f".{subcode:04X}" if subcode is not None else ""
-                                print(f"Packet {packet_count}: Magazine {magazine}, Packet {packet_number} (Header) - Page {page_hex}{subcode_str} [#{appearance_num}]")
-                                if header_text:
-                                    print(f"  Header: {header_text}")
-                                if control_bits:
-                                    # Display only active control bits (value = 1)
-                                    active_controls = [name for name, value in control_bits.items() if value == 1]
-                                    if active_controls:
-                                        ctrl_str = ", ".join(active_controls)
-                                        print(f"  Control: {ctrl_str}")
-                                filtered_count += 1
-                        else:
-                            current_page_matches = False
-                    else:
-                        # Non-header packet - only show if we're in a matching page
-                        if current_page_matches:
-                            # Apply magazine filter if specified
-                            if filter_magazine is None or magazine == filter_magazine:
-                                if decode_data and 1 <= packet_number <= 24:
-                                    # Decode data packet text - output with packet number prefix
-                                    text = decode_data_packet(packet)
-                                    if text:
-                                        print(f"[{packet_number:02d}]: {text}")
-                                elif packet_number == 27:
-                                    # Editorial / compositional page linking packet
-                                    p27 = decode_packet_27(packet, magazine)
-                                    if p27 is not None:
-                                        dc = p27['designation_code']
-                                        print(f"Packet {packet_count}: Magazine {magazine}, Packet 27/{dc} (Page Links)")
-                                        link_names = ["Red", "Green", "Yellow", "Cyan", "Index", "Next"]
-                                        for i, link in enumerate(p27['links']):
-                                            name = link_names[i] if i < len(link_names) else f"Link {i}"
-                                            if link['page'] is None:
-                                                print(f"  {name}: [decode error]")
-                                            elif link['no_page']:
-                                                print(f"  {name}: (none)")
-                                            else:
-                                                sc_str = f":{link['subcode']:04X}" if link['subcode'] is not None else ""
-                                                print(f"  {name}: {link['page']}{sc_str}")
-                                        if dc == 0:
-                                            row24_str = "yes" if p27['show_row_24'] else "no"
-                                            print(f"  Show row 24: {row24_str}")
-                                            if p27['crc'] is not None:
-                                                print(f"  CRC: 0x{p27['crc']:04X}")
-                                    else:
-                                        print(f"Packet {packet_count}: Magazine {magazine}, Packet {packet_number} (decode error)")
-                                else:
-                                    print(f"Packet {packet_count}: Magazine {magazine}, Packet {packet_number}")
-                                filtered_count += 1
-                else:
-                    if filter_magazine is None:
-                        print(f"Packet {packet_count}: Error decoding header")
-        
+
+                lines, current_page_matches, current_page_hex = _describe_packet(
+                    packet, packet_count, magazine, packet_number,
+                    decode_data, page_appearance_counts, current_page_matches,
+                    filter_magazine, filter_page, current_page_hex,
+                )
+                for line in lines:
+                    print(line)
+                if lines:
+                    filtered_count += 1
+
         print(f"\nTotal packets processed: {packet_count}")
         if filter_magazine is not None:
             print(f"Magazine {filter_magazine} packets: {filtered_count}")
-        
+
+    except FileNotFoundError:
+        print(f"Error: File '{filename}' not found")
+    except Exception as e:
+        print(f"Error processing file: {e}")
+
+
+def compare_packets(filename, pos_a, pos_b, decode_data=False):
+    """
+    Read the two packets at stream positions *pos_a* and *pos_b* (1-based)
+    and print a side-by-side comparison of their decoded content.
+
+    Args:
+        filename: path to the T42 binary file
+        pos_a: 1-based stream position of the first packet
+        pos_b: 1-based stream position of the second packet
+        decode_data: if True, decode text content of data packets
+    """
+    packet_size = 42
+    targets = {pos_a, pos_b}
+    found = {}
+
+    try:
+        with open(filename, 'rb') as f:
+            pos = 0
+            while targets - set(found):
+                packet = f.read(packet_size)
+                if len(packet) < packet_size:
+                    break
+                pos += 1
+                if pos in targets:
+                    found[pos] = bytes(packet)
+
+        for p in (pos_a, pos_b):
+            if p not in found:
+                print(f"Error: Packet <{p}> not found in '{filename}'")
+                return
+
+        def describe(pos):
+            packet = found[pos]
+            magazine, packet_number = parse_packet_header(packet)
+            lines, _, _ = _describe_packet(
+                packet, pos, magazine, packet_number,
+                decode_data, {}, True, None, None, None,
+            )
+            return lines
+
+        lines_a = describe(pos_a)
+        lines_b = describe(pos_b)
+
+        # Raw hex for the two packets
+        hex_a = found[pos_a].hex(' ')
+        hex_b = found[pos_b].hex(' ')
+
+        col = 52  # width of each column
+
+        print(f"{'─' * col}  {'─' * col}")
+        print(f"  Packet <{pos_a}>".ljust(col) + "  " + f"  Packet <{pos_b}>")
+        print(f"{'─' * col}  {'─' * col}")
+
+        def _strip_pos(line):
+            """Remove the leading '<N> ' position prefix for content comparison."""
+            if line.startswith('<'):
+                close = line.find('> ')
+                if close != -1:
+                    return line[close + 2:]
+            return line
+
+        max_lines = max(len(lines_a), len(lines_b))
+        for i in range(max_lines):
+            left  = lines_a[i] if i < len(lines_a) else ""
+            right = lines_b[i] if i < len(lines_b) else ""
+            marker = "≠" if _strip_pos(left) != _strip_pos(right) else " "
+            print(f"{left.ljust(col)}{marker} {right}")
+
+        print(f"{'─' * col}  {'─' * col}")
+        print(f"Raw hex <{pos_a}>:")
+        print(f"  {hex_a}")
+        print(f"Raw hex <{pos_b}>:")
+        print(f"  {hex_b}")
+        if hex_a == hex_b:
+            print("Packets are byte-for-byte identical.")
+        else:
+            # Highlight differing byte positions
+            bytes_a = found[pos_a]
+            bytes_b = found[pos_b]
+            diff_positions = [i for i in range(42) if bytes_a[i] != bytes_b[i]]
+            print(f"Differing byte positions (0-based): {diff_positions}")
+
     except FileNotFoundError:
         print(f"Error: File '{filename}' not found")
     except Exception as e:
@@ -528,7 +639,7 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
 def main():
     """Main entry point for the script."""
     import sys
-    
+
     if len(sys.argv) < 2:
         print("Usage: python t42parser.py <input_file> [options]")
         print("\nProcesses a T42 Teletext packet stream from a binary file.")
@@ -539,17 +650,19 @@ def main():
         print("  --decode-data       Decode and display text from data packets (1-24)")
         print("  --stats             Analyze packet counts per page and flag deviations")
         print("  --deviations-only   With --stats, only show pages with deviations")
+        print("  --compare N1 N2     Compare two packets by their stream position numbers")
         sys.exit(1)
-    
+
     input_file = sys.argv[1]
-    
+
     # Check for options
     filter_magazine = None
     filter_page = None
     decode_data = False
     stats_mode = False
     only_deviations = False
-    
+    compare_positions = None
+
     i = 2
     while i < len(sys.argv):
         arg = sys.argv[i]
@@ -583,12 +696,29 @@ def main():
             else:
                 print("Error: --page requires a page number argument")
                 sys.exit(1)
+        elif arg == "--compare":
+            if i + 2 < len(sys.argv):
+                try:
+                    n1 = int(sys.argv[i + 1])
+                    n2 = int(sys.argv[i + 2])
+                    if n1 < 1 or n2 < 1:
+                        print("Error: --compare positions must be positive integers")
+                        sys.exit(1)
+                    compare_positions = (n1, n2)
+                    i += 3
+                except ValueError:
+                    print("Error: --compare requires two integer arguments")
+                    sys.exit(1)
+            else:
+                print("Error: --compare requires two packet position arguments")
+                sys.exit(1)
         else:
             print(f"Error: Unknown argument '{arg}'")
             sys.exit(1)
-    
-    # Stats mode is exclusive
-    if stats_mode:
+
+    if compare_positions is not None:
+        compare_packets(input_file, compare_positions[0], compare_positions[1], decode_data)
+    elif stats_mode:
         analyze_page_statistics(input_file, only_deviations)
     else:
         if only_deviations:
@@ -602,7 +732,7 @@ def main():
             print("Decoding data packets (1-24)")
         if filter_magazine or filter_page or decode_data:
             print()
-        
+
         process_t42_file(input_file, filter_magazine, decode_data, filter_page)
 
 

@@ -21,6 +21,11 @@ Options:
                         '#' positions.  The rendered string must be exactly as
                         long as the number of '#' characters in the mask.
                         Default: "%H:%M:%S"
+    --control NAME=VAL  Force a page-header control bit on or off.
+                        May be supplied multiple times. NAME may be C4-C11 or:
+                        erase, newsflash, subtitle, suppress-header, update,
+                        interrupted-sequence, inhibit-display, magazine-serial.
+                        VAL may be 0/off/false or 1/on/true.
     --loop              Loop through the file indefinitely (streams continuously).
     --magazine MAG      Only stream packets from this magazine number (1-8).
     --page PAGE         Only stream packets for this page number (e.g. 172, 1BA).
@@ -39,7 +44,7 @@ import sys
 import os
 import datetime
 
-from teletext_helpers import hamming_8_4_decode, encode_text_byte
+from teletext_helpers import hamming_8_4_decode, hamming_8_4_encode, encode_text_byte
 
 PACKET_SIZE = 42
 # Header text occupies packet bytes 10-41 (32 characters shown on screen)
@@ -48,6 +53,32 @@ HEADER_TEXT_LEN = 32
 
 DEFAULT_MASK = "?" * 24 + "########"
 DEFAULT_TIME_FORMAT = "%H:%M:%S"
+
+CONTROL_BIT_FIELDS = {
+    'C4': (5, 3),
+    'C5': (7, 2),
+    'C6': (7, 3),
+    'C7': (8, 0),
+    'C8': (8, 1),
+    'C9': (8, 2),
+    'C10': (8, 3),
+    'C11': (9, 0),
+}
+
+CONTROL_BIT_ALIASES = {
+    'erase': 'C4',
+    'newsflash': 'C5',
+    'subtitle': 'C6',
+    'suppress-header': 'C7',
+    'suppress_header': 'C7',
+    'update': 'C8',
+    'interrupted-sequence': 'C9',
+    'interrupted_sequence': 'C9',
+    'inhibit-display': 'C10',
+    'inhibit_display': 'C10',
+    'magazine-serial': 'C11',
+    'magazine_serial': 'C11',
+}
 
 
 def _parse_packet_address(packet_data):
@@ -108,7 +139,42 @@ def _parse_page_sort_key(header_packet):
     return (page_tens, page_units, subcode)
 
 
-def _apply_time_to_header(packet_data, mask, time_format):
+def _apply_control_bit_overrides(packet_data, control_overrides):
+    """
+    Return a modified copy of *packet_data* with selected page-header control
+    bits forced to the requested values.
+    """
+    if not control_overrides:
+        return packet_data
+
+    packet = bytearray(packet_data)
+    decoded_bytes = {}
+
+    for control_name, value in control_overrides.items():
+        byte_index, bit_index = CONTROL_BIT_FIELDS[control_name]
+        if byte_index not in decoded_bytes:
+            decoded = hamming_8_4_decode(packet[byte_index])
+            if decoded is None:
+                raise ValueError(
+                    f"Cannot decode header control byte {byte_index} to override {control_name}."
+                )
+            decoded_bytes[byte_index] = decoded
+
+        nibble = decoded_bytes[byte_index]
+        if value:
+            nibble |= (1 << bit_index)
+        else:
+            nibble &= ~(1 << bit_index)
+        decoded_bytes[byte_index] = nibble
+
+    for byte_index, nibble in decoded_bytes.items():
+        packet[byte_index] = hamming_8_4_encode(nibble)
+
+    return bytes(packet)
+
+
+
+def _apply_time_to_header(packet_data, mask, time_format, control_overrides=None):
     """
     Return a modified copy of *packet_data* with the '#'-masked header
     positions replaced by the current time formatted with *time_format*.
@@ -120,6 +186,7 @@ def _apply_time_to_header(packet_data, mask, time_format):
               '#' marks positions to replace, '?' leaves original byte
         time_format: strftime format string; rendered string length must equal
                      the number of '#' characters in the mask
+        control_overrides: optional dict mapping control names (C4-C11) to 0/1
 
     Returns:
         bytes: modified packet
@@ -134,7 +201,7 @@ def _apply_time_to_header(packet_data, mask, time_format):
             f"mask has {hash_count} '#' positions — they must match."
         )
 
-    packet = bytearray(packet_data)
+    packet = bytearray(_apply_control_bit_overrides(packet_data, control_overrides))
     time_index = 0
     for i, ch in enumerate(mask):
         if ch == '#':
@@ -249,7 +316,8 @@ def _interleave_pages(pages_by_mag):
 
 
 def restream(input_file, mask, time_format, loop, output=None,
-             filter_magazine=None, filter_page=None, interleave=False):
+             filter_magazine=None, filter_page=None, interleave=False,
+             control_overrides=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -266,6 +334,7 @@ def restream(input_file, mask, time_format, loop, output=None,
         filter_page: if not None, only emit packets for this page (e.g. '172')
         interleave: if True, re-order the stream so pages from different
                     magazines are interleaved round-robin
+        control_overrides: optional dict mapping control names (C4-C11) to 0/1
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -276,7 +345,8 @@ def restream(input_file, mask, time_format, loop, output=None,
         output = sys.stdout.buffer
 
     if interleave:
-        _restream_interleaved(input_file, mask, time_format, loop, output)
+        _restream_interleaved(input_file, mask, time_format, loop, output,
+                              control_overrides)
         return
 
     # Normalise filter_page to uppercase for comparison
@@ -338,7 +408,8 @@ def restream(input_file, mask, time_format, loop, output=None,
 
                 if current_page_matches:
                     # Inject current time into header
-                    packet = _apply_time_to_header(packet, mask, time_format)
+                    packet = _apply_time_to_header(packet, mask, time_format,
+                                                   control_overrides)
                 else:
                     #ensure we don't output non matching header packets
                     continue
@@ -351,7 +422,8 @@ def restream(input_file, mask, time_format, loop, output=None,
             output.flush()
 
 
-def _restream_interleaved(input_file, mask, time_format, loop, output):
+def _restream_interleaved(input_file, mask, time_format, loop, output,
+                         control_overrides=None):
     """
     Emit packets from *input_file* interleaved round-robin by magazine.
 
@@ -368,7 +440,8 @@ def _restream_interleaved(input_file, mask, time_format, loop, output):
 
         for page_packets in _interleave_pages(pages_by_mag):
             # page_packets[0] is always the header packet
-            header = _apply_time_to_header(page_packets[0], mask, time_format)
+            header = _apply_time_to_header(page_packets[0], mask, time_format,
+                                           control_overrides)
             output.write(header)
             output.flush()
             for pkt in page_packets[1:]:
@@ -377,6 +450,26 @@ def _restream_interleaved(input_file, mask, time_format, loop, output):
 
         if not loop:
             break
+
+
+def _parse_control_override(spec):
+    """Parse NAME=VALUE for --control and return (control_name, bit_value)."""
+    if '=' not in spec:
+        raise ValueError("Control override must be in the form NAME=VALUE")
+
+    name, value_text = spec.split('=', 1)
+    key = name.strip().lower()
+    control_name = CONTROL_BIT_ALIASES.get(key, name.strip().upper())
+    if control_name not in CONTROL_BIT_FIELDS:
+        raise ValueError(f"Unknown control bit '{name}'")
+
+    value_key = value_text.strip().lower()
+    if value_key in ('1', 'on', 'true'):
+        return control_name, 1
+    if value_key in ('0', 'off', 'false'):
+        return control_name, 0
+    raise ValueError(f"Invalid control bit value '{value_text}'")
+
 
 
 def main():
@@ -391,6 +484,7 @@ def main():
     filter_magazine = None
     filter_page = None
     interleave = False
+    control_overrides = {}
 
     i = 2
     while i < len(sys.argv):
@@ -432,6 +526,17 @@ def main():
         elif arg == "--interleave":
             interleave = True
             i += 1
+        elif arg == "--control":
+            if i + 1 >= len(sys.argv):
+                print("Error: --control requires an argument", file=sys.stderr)
+                sys.exit(1)
+            try:
+                control_name, control_value = _parse_control_override(sys.argv[i + 1])
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            control_overrides[control_name] = control_value
+            i += 2
         else:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
             sys.exit(1)
@@ -443,7 +548,8 @@ def main():
     try:
         restream(input_file, mask, time_format, loop,
                  filter_magazine=filter_magazine, filter_page=filter_page,
-                 interleave=interleave)
+                 interleave=interleave,
+                 control_overrides=control_overrides)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
