@@ -27,6 +27,8 @@ Options:
                         interrupted-sequence, inhibit-display, magazine-serial.
                         VAL may be 0/off/false or 1/on/true.
     --loop              Loop through the file indefinitely (streams continuously).
+    --suppress-packet N Suppress all packets with packet number N (0-31).
+                        May be supplied multiple times.
     --magazine MAG      Only stream packets from this magazine number (1-8).
     --page PAGE         Only stream packets for this page number (e.g. 172, 1BA).
                         Implies --magazine is set to the magazine of that page if
@@ -317,7 +319,7 @@ def _interleave_pages(pages_by_mag):
 
 def restream(input_file, mask, time_format, loop, output=None,
              filter_magazine=None, filter_page=None, interleave=False,
-             control_overrides=None):
+             control_overrides=None, suppressed_packet_numbers=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -335,6 +337,7 @@ def restream(input_file, mask, time_format, loop, output=None,
         interleave: if True, re-order the stream so pages from different
                     magazines are interleaved round-robin
         control_overrides: optional dict mapping control names (C4-C11) to 0/1
+        suppressed_packet_numbers: optional set of packet numbers (0-31) to drop
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -346,7 +349,7 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if interleave:
         _restream_interleaved(input_file, mask, time_format, loop, output,
-                              control_overrides)
+                              control_overrides, suppressed_packet_numbers)
         return
 
     # Normalise filter_page to uppercase for comparison
@@ -398,6 +401,9 @@ def restream(input_file, mask, time_format, loop, output=None,
                     current_page_matches = False
                 continue
 
+            if suppressed_packet_numbers and packet_number in suppressed_packet_numbers:
+                continue
+
             if packet_number == 0:
                 # Header packet — determine whether this page passes the filter
                 if filter_page_upper is not None:
@@ -423,7 +429,7 @@ def restream(input_file, mask, time_format, loop, output=None,
 
 
 def _restream_interleaved(input_file, mask, time_format, loop, output,
-                         control_overrides=None):
+                         control_overrides=None, suppressed_packet_numbers=None):
     """
     Emit packets from *input_file* interleaved round-robin by magazine.
 
@@ -439,12 +445,17 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
             continue
 
         for page_packets in _interleave_pages(pages_by_mag):
-            # page_packets[0] is always the header packet
-            header = _apply_time_to_header(page_packets[0], mask, time_format,
-                                           control_overrides)
-            output.write(header)
-            output.flush()
+            header_packet = page_packets[0]
+            _, header_packet_number = _parse_packet_address(header_packet)
+            if not (suppressed_packet_numbers and header_packet_number in suppressed_packet_numbers):
+                header = _apply_time_to_header(header_packet, mask, time_format,
+                                               control_overrides)
+                output.write(header)
+                output.flush()
             for pkt in page_packets[1:]:
+                _, packet_number = _parse_packet_address(pkt)
+                if suppressed_packet_numbers and packet_number in suppressed_packet_numbers:
+                    continue
                 output.write(pkt)
                 output.flush()
 
@@ -485,6 +496,7 @@ def main():
     filter_page = None
     interleave = False
     control_overrides = {}
+    suppressed_packet_numbers = set()
 
     i = 2
     while i < len(sys.argv):
@@ -526,6 +538,20 @@ def main():
         elif arg == "--interleave":
             interleave = True
             i += 1
+        elif arg == "--suppress-packet":
+            if i + 1 >= len(sys.argv):
+                print("Error: --suppress-packet requires an argument", file=sys.stderr)
+                sys.exit(1)
+            try:
+                packet_number = int(sys.argv[i + 1])
+            except ValueError:
+                print("Error: --suppress-packet argument must be an integer", file=sys.stderr)
+                sys.exit(1)
+            if packet_number < 0 or packet_number > 31:
+                print("Error: Packet number must be between 0 and 31", file=sys.stderr)
+                sys.exit(1)
+            suppressed_packet_numbers.add(packet_number)
+            i += 2
         elif arg == "--control":
             if i + 1 >= len(sys.argv):
                 print("Error: --control requires an argument", file=sys.stderr)
@@ -549,7 +575,8 @@ def main():
         restream(input_file, mask, time_format, loop,
                  filter_magazine=filter_magazine, filter_page=filter_page,
                  interleave=interleave,
-                 control_overrides=control_overrides)
+                 control_overrides=control_overrides,
+                 suppressed_packet_numbers=suppressed_packet_numbers)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
