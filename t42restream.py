@@ -40,6 +40,10 @@ Options:
                         header) is treated as one unit.  Compatible with --loop;
                         incompatible with --magazine / --page filters (those
                         options are ignored when --interleave is set).
+    --magazine-parallel Re-order emitted packets so each magazine always maps to
+                        the same one of 8 VBI lines. Packets are emitted round-
+                        robin by magazine instead of file order. Compatible with
+                        --loop; incompatible with --interleave.
 """
 
 import sys
@@ -317,9 +321,26 @@ def _interleave_pages(pages_by_mag):
             yield slot[subpage_idx % len(slot)]
 
 
+def _group_pages_into_slots(pages):
+    """Group sorted pages into per-base-page sub-page slots."""
+    seen = {}
+    slots = []
+
+    for page in pages:
+        key = _parse_page_sort_key(page[0])[:2]
+        if key not in seen:
+            seen[key] = len(slots)
+            slots.append([])
+        slots[seen[key]].append(page)
+
+    return slots
+
+
+
 def restream(input_file, mask, time_format, loop, output=None,
              filter_magazine=None, filter_page=None, interleave=False,
-             control_overrides=None, suppressed_packet_numbers=None):
+             magazine_parallel=False, control_overrides=None,
+             suppressed_packet_numbers=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -336,6 +357,8 @@ def restream(input_file, mask, time_format, loop, output=None,
         filter_page: if not None, only emit packets for this page (e.g. '172')
         interleave: if True, re-order the stream so pages from different
                     magazines are interleaved round-robin
+        magazine_parallel: if True, emit packets round-robin by magazine so each
+                           magazine stays on a stable VBI line
         control_overrides: optional dict mapping control names (C4-C11) to 0/1
         suppressed_packet_numbers: optional set of packet numbers (0-31) to drop
     """
@@ -347,9 +370,17 @@ def restream(input_file, mask, time_format, loop, output=None,
     if output is None:
         output = sys.stdout.buffer
 
+    if interleave and magazine_parallel:
+        raise ValueError("--interleave and --magazine-parallel cannot be used together")
+
     if interleave:
         _restream_interleaved(input_file, mask, time_format, loop, output,
                               control_overrides, suppressed_packet_numbers)
+        return
+
+    if magazine_parallel:
+        _restream_magazine_lines(input_file, mask, time_format, loop, output,
+                                 control_overrides, suppressed_packet_numbers)
         return
 
     # Normalise filter_page to uppercase for comparison
@@ -463,6 +494,86 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
             break
 
 
+def _restream_magazine_lines(input_file, mask, time_format, loop, output,
+                             control_overrides=None, suppressed_packet_numbers=None):
+    """Emit packets by magazine with pages ordered numerically and sub-pages stepped in parallel."""
+    while True:
+        pages_by_mag = _read_pages_by_magazine(input_file)
+        if not pages_by_mag:
+            if not loop:
+                break
+            continue
+
+        magazines = list(range(1, 9))
+        slots_by_mag = {
+            magazine: _group_pages_into_slots(pages_by_mag[magazine])
+            for magazine in pages_by_mag
+        }
+        state_by_mag = {magazine: {'slot': 0, 'subpage': 0, 'packet': 0} for magazine in slots_by_mag}
+        cycle_count_by_mag = {magazine: 0 for magazine in slots_by_mag}
+        max_cycles = max(max(len(slot) for slot in slots) for slots in slots_by_mag.values())
+        filler_packets = {
+            magazine: bytes([
+                hamming_8_4_encode(((25 << 3) | (magazine & 0x07)) & 0x0F),
+                hamming_8_4_encode((((25 << 3) | (magazine & 0x07)) >> 4) & 0x0F),
+                *([encode_text_byte(' ')] * (PACKET_SIZE - 2)),
+            ])
+            for magazine in magazines
+        }
+
+        active_magazines = set(slots_by_mag)
+        while active_magazines:
+            for magazine in magazines:
+                if magazine not in slots_by_mag:
+                    if active_magazines:
+                        output.write(filler_packets[magazine])
+                        output.flush()
+                    continue
+
+                if magazine not in active_magazines:
+                    continue
+
+                slots = slots_by_mag[magazine]
+                state = state_by_mag[magazine]
+                slot = slots[state['slot']]
+                page_packets = slot[state['subpage'] % len(slot)]
+                packet = page_packets[state['packet']]
+                _, packet_number = _parse_packet_address(packet)
+                if not (suppressed_packet_numbers and packet_number in suppressed_packet_numbers):
+                    if packet_number == 0:
+                        packet = _apply_time_to_header(packet, mask, time_format,
+                                                       control_overrides)
+                    output.write(packet)
+                    output.flush()
+
+                state['packet'] += 1
+                if state['packet'] < len(page_packets):
+                    continue
+
+                state['packet'] = 0
+                state['slot'] += 1
+                if state['slot'] < len(slots):
+                    continue
+
+                state['slot'] = 0
+                state['subpage'] += 1
+
+                wrapped = True
+                for slot in slots:
+                    if state['subpage'] < len(slot):
+                        wrapped = False
+                        break
+                if wrapped:
+                    state['subpage'] = 0
+                    cycle_count_by_mag[magazine] += 1
+                    if not loop and cycle_count_by_mag[magazine] >= max_cycles:
+                        active_magazines.remove(magazine)
+
+        if not loop:
+            break
+
+
+
 def _parse_control_override(spec):
     """Parse NAME=VALUE for --control and return (control_name, bit_value)."""
     if '=' not in spec:
@@ -495,6 +606,7 @@ def main():
     filter_magazine = None
     filter_page = None
     interleave = False
+    magazine_parallel = False
     control_overrides = {}
     suppressed_packet_numbers = set()
 
@@ -538,6 +650,9 @@ def main():
         elif arg == "--interleave":
             interleave = True
             i += 1
+        elif arg == "--magazine-parallel":
+            magazine_parallel = True
+            i += 1
         elif arg == "--suppress-packet":
             if i + 1 >= len(sys.argv):
                 print("Error: --suppress-packet requires an argument", file=sys.stderr)
@@ -574,7 +689,7 @@ def main():
     try:
         restream(input_file, mask, time_format, loop,
                  filter_magazine=filter_magazine, filter_page=filter_page,
-                 interleave=interleave,
+                 interleave=interleave, magazine_parallel=magazine_parallel,
                  control_overrides=control_overrides,
                  suppressed_packet_numbers=suppressed_packet_numbers)
     except ValueError as e:
