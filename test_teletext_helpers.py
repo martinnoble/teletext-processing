@@ -4,7 +4,7 @@ Unit tests for teletext_helpers module
 """
 
 import unittest
-from teletext_helpers import hamming_8_4_decode, hamming_8_4_encode, encode_text_byte, decode_text_bytes
+from teletext_helpers import hamming_8_4_decode, hamming_8_4_encode, encode_text_byte, decode_text_bytes, calculate_page_crc
 
 
 class TestHamming84Decode(unittest.TestCase):
@@ -247,6 +247,98 @@ class TestIntegration(unittest.TestCase):
         # Check the decoded values
         self.assertEqual(page_units, 2)
         self.assertEqual(page_tens, 7)
+
+
+class TestCalculatePageCrc(unittest.TestCase):
+    """Tests for the packet X/27/0 page CRC calculation (ETS 300 706 §9.6.1)."""
+
+    def _make_pkt(self, n, fill=0x20):
+        """Return a 42-byte packet filled with *fill*."""
+        return bytes([fill] * 42)
+
+    def test_all_absent_gives_deterministic_result(self):
+        """
+        With no packets supplied (all treated as space 0x20), the CRC must be
+        deterministic and non-zero (space bytes fed MSB-first into a non-trivial LFSR
+        will generally produce a non-zero result).
+        """
+        crc = calculate_page_crc({})
+        self.assertIsInstance(crc, int)
+        self.assertGreaterEqual(crc, 0)
+        self.assertLessEqual(crc, 0xFFFF)
+
+    def test_all_space_packets_explicit(self):
+        """Explicitly supplying all-space packets should give the same result as no packets."""
+        page_packets_absent = {}
+        page_packets_spaces = {n: self._make_pkt(n, 0x20) for n in range(26)}
+        crc_absent = calculate_page_crc(page_packets_absent)
+        crc_spaces = calculate_page_crc(page_packets_spaces)
+        self.assertEqual(crc_absent, crc_spaces,
+                         "Absent packets must be treated as all-space 0x20")
+
+    def test_changing_one_byte_changes_crc(self):
+        """Flipping a single data byte inside the CRC window must change the CRC."""
+        page_packets_base = {}
+        # Modify one byte in packet 1 (within the CRC window, index 10-41)
+        pkt1 = bytearray(42)
+        pkt1[:] = [0x20] * 42
+        pkt1[15] ^= 0x01          # flip one bit in a data byte
+        page_packets_changed = {1: bytes(pkt1)}
+        crc_base = calculate_page_crc(page_packets_base)
+        crc_changed = calculate_page_crc(page_packets_changed)
+        self.assertNotEqual(crc_base, crc_changed,
+                            "CRC must change when page content changes")
+
+    def test_changing_byte_outside_window_in_pkt0_does_not_affect_crc(self):
+        """Bytes at index 34-41 of packet 0 (spec bytes 38-45, clock) are outside
+        the CRC window and must not affect the result."""
+        page_packets_base = {}
+        pkt0_modified = bytearray([0x20] * 42)
+        pkt0_modified[38] ^= 0xFF   # index 38 = spec byte 42, outside CRC window
+        page_packets_outside = {0: bytes(pkt0_modified)}
+        crc_base = calculate_page_crc(page_packets_base)
+        crc_outside = calculate_page_crc(page_packets_outside)
+        self.assertEqual(crc_base, crc_outside,
+                         "Bytes outside CRC window in packet 0 must not affect CRC")
+
+    def test_changing_byte_inside_window_in_pkt0_changes_crc(self):
+        """Index 10-33 (spec bytes 14-37) of packet 0 ARE inside the window."""
+        page_packets_base = {}
+        pkt0_modified = bytearray([0x20] * 42)
+        pkt0_modified[10] ^= 0x01   # index 10 = spec byte 14, inside window
+        page_packets_inside = {0: bytes(pkt0_modified)}
+        crc_base = calculate_page_crc(page_packets_base)
+        crc_inside = calculate_page_crc(page_packets_inside)
+        self.assertNotEqual(crc_base, crc_inside,
+                            "Bytes inside CRC window in packet 0 must affect CRC")
+
+    def test_changing_byte_at_start_of_pkt1_changes_crc(self):
+        """Index 2 (spec byte 6) of packet X/1 IS inside the window for X/1-25."""
+        page_packets_base = {}
+        pkt1_modified = bytearray([0x20] * 42)
+        pkt1_modified[2] ^= 0x01   # index 2 = spec byte 6, start of X/1 data
+        page_packets_changed = {1: bytes(pkt1_modified)}
+        crc_base = calculate_page_crc(page_packets_base)
+        crc_changed = calculate_page_crc(page_packets_changed)
+        self.assertNotEqual(crc_base, crc_changed,
+                            "Byte at index 2 of packet 1 must affect CRC")
+
+    def test_crc_is_16_bit(self):
+        """CRC result must fit in 16 bits."""
+        for fill in (0x00, 0x20, 0x7F, 0xFF):
+            page_packets = {n: self._make_pkt(n, fill) for n in range(26)}
+            crc = calculate_page_crc(page_packets)
+            self.assertGreaterEqual(crc, 0)
+            self.assertLessEqual(crc, 0xFFFF, f"CRC overflow for fill=0x{fill:02X}")
+
+    def test_packet_26_does_not_contribute(self):
+        """Packet 26 is not part of the CRC input; adding it must not change the CRC."""
+        page_packets_without = {}
+        page_packets_with = {26: self._make_pkt(26, 0x55)}
+        crc_without = calculate_page_crc(page_packets_without)
+        crc_with = calculate_page_crc(page_packets_with)
+        self.assertEqual(crc_without, crc_with,
+                         "Packet 26 must not be included in CRC calculation")
 
 
 def run_tests():

@@ -6,7 +6,7 @@ Processes T42 Teletext packet streams from binary files.
 Each packet is 42 bytes (45 bytes minus the first 3 bytes of clock run-in and framing).
 """
 
-from teletext_helpers import hamming_8_4_decode, decode_text_bytes
+from teletext_helpers import hamming_8_4_decode, hamming_8_4_decode_checked, decode_text_bytes, decode_text_bytes_checked, calculate_page_crc
 
 
 def parse_packet_header(packet_data):
@@ -58,33 +58,31 @@ def decode_page_header(packet_data):
         packet_data: bytes object containing the 42-byte packet
         
     Returns:
-        tuple: (page_units, page_tens, subcode, control_bits, header_text) or (None, None, None, None, None) if error
+        tuple: (page_units, page_tens, subcode, control_bits, header_text, hamming_errors)
+               or (None, None, None, None, None, False) if unrecoverable error.
+               hamming_errors is True when any Hamming byte needed single-bit correction.
     """
     if len(packet_data) < 42:
-        return None, None, None, None, None
+        return None, None, None, None, None, False
     
+    hamming_errors = False
+
     # Bytes 2 and 3 contain the page number (after the 2-byte packet address)
-    # Byte 2: page units (Hamming 8/4 encoded)
-    # Byte 3: page tens (Hamming 8/4 encoded)
-    page_units = hamming_8_4_decode(packet_data[2])
-    page_tens = hamming_8_4_decode(packet_data[3])
+    page_units, c = hamming_8_4_decode_checked(packet_data[2])
+    hamming_errors |= c
+    page_tens, c = hamming_8_4_decode_checked(packet_data[3])
+    hamming_errors |= c
     
     if page_units is None or page_tens is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, False
     
     # Bytes 4-9 contain the sub-code and control bits (6 bytes, each Hamming 8/4 encoded)
-    # S1 (byte 4): bits 0-3 of sub-code
-    # S2 (byte 5): bits 0-2 are sub-code bits 4-6, bit 3 is C4
-    # S3 (byte 6): bits 0-3 are sub-code bits 7-10
-    # S4 (byte 7): bits 0-1 are sub-code bits 11-12, bits 2-3 are C5-C6
-    # C8 (byte 8): bits 0-3 are C7-C10
-    # C9 (byte 9): bits 0-3 are C11-C14 
-    s1 = hamming_8_4_decode(packet_data[4])
-    s2 = hamming_8_4_decode(packet_data[5])
-    s3 = hamming_8_4_decode(packet_data[6])
-    s4 = hamming_8_4_decode(packet_data[7])
-    c8 = hamming_8_4_decode(packet_data[8])
-    c9 = hamming_8_4_decode(packet_data[9])
+    s1, c = hamming_8_4_decode_checked(packet_data[4]); hamming_errors |= c
+    s2, c = hamming_8_4_decode_checked(packet_data[5]); hamming_errors |= c
+    s3, c = hamming_8_4_decode_checked(packet_data[6]); hamming_errors |= c
+    s4, c = hamming_8_4_decode_checked(packet_data[7]); hamming_errors |= c
+    c8, c = hamming_8_4_decode_checked(packet_data[8]); hamming_errors |= c
+    c9, c = hamming_8_4_decode_checked(packet_data[9]); hamming_errors |= c
     
     if s1 is None or s2 is None or s3 is None or s4 is None or c8 is None or c9 is None:
         subcode = None
@@ -104,26 +102,21 @@ def decode_page_header(packet_data):
         subcode = subcode_bits
         
         # Extract control bits (C4-C11, ignore C12-C14)
-        # Based on byte descriptions:
-        # S2 bit 3: C4
-        # S4 bits 2-3: C5-C6
-        # C8 bits 0-3: C7-C10
-        # C9 bits 0: C11
         control_bits = {
-            'Erase': (s2 >> 3) & 1,                    # C4 from S2 bit 3
-            'Newsflash': (s4 >> 2) & 1,                # C5 from S4 bit 2
-            'Subtitle': (s4 >> 3) & 1,                 # C6 from S4 bit 3
-            'Suppress Header': (c8 >> 0) & 1,          # C7 from C8 bit 0
-            'Update': (c8 >> 1) & 1,                   # C8 from C8 bit 1
-            'Interrupted Sequence': (c8 >> 2) & 1,     # C9 from C8 bit 2
-            'Inhibit Display': (c8 >> 3) & 1,          # C10 from C8 bit 3
-            'Magazine Serial': (c9 >> 0) & 1,          # C11 from C9 bit 0
+            'Erase': (s2 >> 3) & 1,
+            'Newsflash': (s4 >> 2) & 1,
+            'Subtitle': (s4 >> 3) & 1,
+            'Suppress Header': (c8 >> 0) & 1,
+            'Update': (c8 >> 1) & 1,
+            'Interrupted Sequence': (c8 >> 2) & 1,
+            'Inhibit Display': (c8 >> 3) & 1,
+            'Magazine Serial': (c9 >> 0) & 1,
         }
     
     # The last 32 bytes (bytes 10-41) contain the header text
     header_text = decode_text_bytes(packet_data, 10, 42)
     
-    return page_units, page_tens, subcode, control_bits, header_text
+    return page_units, page_tens, subcode, control_bits, header_text, hamming_errors
 
 
 def decode_packet_27(packet_data, magazine):
@@ -167,8 +160,11 @@ def decode_packet_27(packet_data, magazine):
     if len(packet_data) < 42:
         return None
 
+    hamming_errors = False
+
     # Index 2 = spec byte 6 = designation code
-    desig_raw = hamming_8_4_decode(packet_data[2])
+    desig_raw, c = hamming_8_4_decode_checked(packet_data[2])
+    hamming_errors |= c
     if desig_raw is None:
         return None
     designation_code = desig_raw & 0x0F
@@ -178,12 +174,12 @@ def decode_packet_27(packet_data, magazine):
     for n in range(6):
         base = 3 + n * 6
 
-        pu_raw = hamming_8_4_decode(packet_data[base + 0])  # page units
-        pt_raw = hamming_8_4_decode(packet_data[base + 1])  # page tens
-        s1_raw = hamming_8_4_decode(packet_data[base + 2])  # S1
-        s2_raw = hamming_8_4_decode(packet_data[base + 3])  # S2 + M1
-        s3_raw = hamming_8_4_decode(packet_data[base + 4])  # S3
-        s4_raw = hamming_8_4_decode(packet_data[base + 5])  # S4 + M2 + M3
+        pu_raw, c = hamming_8_4_decode_checked(packet_data[base + 0]); hamming_errors |= c
+        pt_raw, c = hamming_8_4_decode_checked(packet_data[base + 1]); hamming_errors |= c
+        s1_raw, c = hamming_8_4_decode_checked(packet_data[base + 2]); hamming_errors |= c
+        s2_raw, c = hamming_8_4_decode_checked(packet_data[base + 3]); hamming_errors |= c
+        s3_raw, c = hamming_8_4_decode_checked(packet_data[base + 4]); hamming_errors |= c
+        s4_raw, c = hamming_8_4_decode_checked(packet_data[base + 5]); hamming_errors |= c
 
         if any(v is None for v in (pu_raw, pt_raw, s1_raw, s2_raw, s3_raw, s4_raw)):
             links.append({'page': None, 'subcode': None, 'no_page': False})
@@ -223,7 +219,8 @@ def decode_packet_27(packet_data, magazine):
 
     if designation_code == 0:
         # Index 39 = spec byte 43 = Link Control Byte (Hamming 8/4)
-        lc_raw = hamming_8_4_decode(packet_data[39])
+        lc_raw, c = hamming_8_4_decode_checked(packet_data[39])
+        hamming_errors |= c
         if lc_raw is not None:
             link_control = lc_raw & 0x0F
             show_row_24 = bool((link_control >> 3) & 1)
@@ -237,6 +234,7 @@ def decode_packet_27(packet_data, magazine):
         'link_control': link_control,
         'show_row_24': show_row_24,
         'crc': crc,
+        'hamming_errors': hamming_errors,
     }
 
 
@@ -248,13 +246,14 @@ def decode_data_packet(packet_data):
         packet_data: bytes object containing the 42-byte packet
         
     Returns:
-        str: decoded text from the packet (40 bytes)
+        (text, bad_cols): decoded text and a set of 0-based column indices
+        that failed odd-parity check. Returns (None, set()) if packet is too short.
     """
     if len(packet_data) < 42:
-        return None
+        return None, set()
     
     # The last 40 bytes (bytes 2-41) contain the text data
-    return decode_text_bytes(packet_data, 2, 42)
+    return decode_text_bytes_checked(packet_data, 2, 42)
 
 
 def analyze_page_statistics(filename, only_deviations=False):
@@ -290,7 +289,7 @@ def analyze_page_statistics(filename, only_deviations=False):
                 if magazine is not None and packet_number is not None:
                     if packet_number == 0:
                         # Header packet - new page
-                        page_units, page_tens, subcode, control_bits, header_text = decode_page_header(packet)
+                        page_units, page_tens, subcode, control_bits, header_text, _hec = decode_page_header(packet)
                         
                         if page_units is not None and page_tens is not None:
                             # Save previous page stats
@@ -406,7 +405,8 @@ def analyze_page_statistics(filename, only_deviations=False):
 
 def _describe_packet(packet, packet_pos, magazine, packet_number,
                      decode_data, page_appearance_counts, current_page_matches,
-                     filter_magazine, filter_page, page_hex_ref):
+                     filter_magazine, filter_page, page_hex_ref,
+                     page_packets=None):
     """
     Return a list of output lines describing *packet*, with each line already
     prefixed by ``<packet_pos>``.  Also updates *page_appearance_counts* in-place
@@ -417,6 +417,9 @@ def _describe_packet(packet, packet_pos, magazine, packet_number,
 
     page_hex_ref is the current page_hex passed in so non-header packets can
     reference it.
+
+    page_packets: optional dict mapping packet_number (0-25) → raw bytes for the
+    current page of this magazine.  Used to verify the CRC in packet X/27/0.
 
     Returns (lines, new_current_page_matches, new_page_hex).
     """
@@ -430,7 +433,7 @@ def _describe_packet(packet, packet_pos, magazine, packet_number,
         return lines, current_page_matches, new_page_hex
 
     if packet_number == 0:
-        page_units, page_tens, subcode, control_bits, header_text = decode_page_header(packet)
+        page_units, page_tens, subcode, control_bits, header_text, hamming_errors = decode_page_header(packet)
         if page_units is not None and page_tens is not None:
             new_page_hex = f"{magazine:X}{page_tens:X}{page_units:X}"
 
@@ -446,8 +449,9 @@ def _describe_packet(packet, packet_pos, magazine, packet_number,
                 page_matches = False
 
             if page_matches:
+                hamming_tag = " [HAMMING]" if hamming_errors else ""
                 subcode_str = f".{subcode:04X}" if subcode is not None else ""
-                lines.append(f"{pos} Magazine {magazine}, Packet {packet_number} (Header) - Page {new_page_hex}{subcode_str} [#{appearance_num}]")
+                lines.append(f"{pos} Magazine {magazine}, Packet {packet_number} (Header) - Page {new_page_hex}{subcode_str} [#{appearance_num}]{hamming_tag}")
                 if header_text:
                     lines.append(f"{pos}   Header: {header_text}")
                 if control_bits:
@@ -465,14 +469,21 @@ def _describe_packet(packet, packet_pos, magazine, packet_number,
             return lines, current_page_matches, new_page_hex
 
         if decode_data and 1 <= packet_number <= 24:
-            text = decode_data_packet(packet)
+            text, bad_cols = decode_data_packet(packet)
             if text:
-                lines.append(f"{pos} [{packet_number:02d}]: {text}")
+                lines.append(f"{pos} [{magazine},{packet_number:02d}]: {text}")
+                if bad_cols:
+                    # Build an underline showing exactly which columns had parity errors.
+                    # Prefix width matches "<N> [M,PP]: " so the carets align under the text.
+                    prefix_width = len(f"{pos} [{magazine},{packet_number:02d}]: ")
+                    underline = ''.join('^' if c in bad_cols else ' ' for c in range(len(text)))
+                    lines.append(f"{' ' * prefix_width}{underline}  [PARITY]")
         elif packet_number == 27:
             p27 = decode_packet_27(packet, magazine)
             if p27 is not None:
                 dc = p27['designation_code']
-                lines.append(f"{pos} Magazine {magazine}, Packet 27/{dc} (Page Links)")
+                hamming_tag = " [HAMMING]" if p27['hamming_errors'] else ""
+                lines.append(f"{pos} Magazine {magazine}, Packet 27/{dc} (Page Links){hamming_tag}")
                 link_names = ["Red", "Green", "Yellow", "Cyan", "Index", "Next"]
                 for i, link in enumerate(p27['links']):
                     name = link_names[i] if i < len(link_names) else f"Link {i}"
@@ -487,7 +498,15 @@ def _describe_packet(packet, packet_pos, magazine, packet_number,
                     row24_str = "yes" if p27['show_row_24'] else "no"
                     lines.append(f"{pos}   Show row 24: {row24_str}")
                     if p27['crc'] is not None:
-                        lines.append(f"{pos}   CRC: 0x{p27['crc']:04X}")
+                        crc_stored = p27['crc']
+                        if page_packets is not None:
+                            crc_calc = calculate_page_crc(page_packets)
+                            if crc_calc == crc_stored:
+                                lines.append(f"{pos}   CRC: 0x{crc_stored:04X} [OK]")
+                            else:
+                                lines.append(f"{pos}   CRC: 0x{crc_stored:04X} [FAIL, calculated 0x{crc_calc:04X}]")
+                        else:
+                            lines.append(f"{pos}   CRC: 0x{crc_stored:04X}")
             else:
                 lines.append(f"{pos} Magazine {magazine}, Packet {packet_number} (decode error)")
         else:
@@ -512,6 +531,9 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
     current_page_matches = False
     current_page_hex = None
     page_appearance_counts = {}
+    # Per-magazine store of packets for the current page (0-25 → raw bytes).
+    # Keyed by magazine number (1-8).  Reset on each new page header.
+    mag_page_packets = {}
 
     try:
         with open(filename, 'rb') as f:
@@ -528,10 +550,20 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
                 packet_count += 1
                 magazine, packet_number = parse_packet_header(packet)
 
+                # Maintain per-magazine packet store for CRC verification.
+                if magazine is not None and packet_number is not None:
+                    if packet_number == 0:
+                        mag_page_packets[magazine] = {0: bytes(packet)}
+                    elif 1 <= packet_number <= 25:
+                        if magazine not in mag_page_packets:
+                            mag_page_packets[magazine] = {}
+                        mag_page_packets[magazine][packet_number] = bytes(packet)
+
                 lines, current_page_matches, current_page_hex = _describe_packet(
                     packet, packet_count, magazine, packet_number,
                     decode_data, page_appearance_counts, current_page_matches,
                     filter_magazine, filter_page, current_page_hex,
+                    page_packets=mag_page_packets.get(magazine) if magazine is not None else None,
                 )
                 for line in lines:
                     print(line)
