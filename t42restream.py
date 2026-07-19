@@ -571,7 +571,7 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
                      mask, time_format, control_overrides,
                      suppressed_packet_numbers, loop, max_cycles,
                      cycle_count_by_mag, filler_packets, primary_line,
-                     current_line_idx, output):
+                     current_line_idx, header_emitted_this_field, output):
     """
     Emit the next packet for *magazine* and advance its state.
 
@@ -579,6 +579,11 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
     *current_line_idx* is not this magazine's primary line, a filler packet is
     emitted instead and the state is left unchanged so the header is deferred
     to the next turn when the primary line is active.
+
+    If a header was already emitted for *magazine* earlier in the current field
+    (tracked via *header_emitted_this_field*), a filler is emitted and state is
+    left unchanged so that content packets don't appear in the same field as
+    their header.
 
     Removes the magazine from *active_magazines* when its run is complete
     (only relevant when loop=False).
@@ -600,10 +605,19 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
         output.flush()
         return
 
+    # If the header for the current page (identified by slot+subpage) was already
+    # emitted in this field, hold off on its content packets until the next field.
+    page_key = (magazine, state['slot'], state['subpage'] % len(slot))
+    if packet_number != 0 and page_key in header_emitted_this_field:
+        output.write(filler_packets[magazine])
+        output.flush()
+        return
+
     if not (suppressed_packet_numbers and packet_number in suppressed_packet_numbers):
         if packet_number == 0:
             packet = _apply_time_to_header(packet, mask, time_format,
                                            control_overrides)
+            header_emitted_this_field.add(page_key)
         output.write(packet)
         output.flush()
 
@@ -669,6 +683,7 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
 
         active_magazines = set(slots_by_mag)
         while active_magazines:
+            header_emitted_this_field = set()
             for line_idx, line_mags in enumerate(vbi_schedule):
                 if not line_mags:
                     continue
@@ -684,7 +699,8 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
                                  active_magazines, mask, time_format,
                                  control_overrides, suppressed_packet_numbers,
                                  loop, max_cycles, cycle_count_by_mag,
-                                 filler_packets, primary_line, line_idx, output)
+                                 filler_packets, primary_line, line_idx,
+                                 header_emitted_this_field, output)
 
         if not loop:
             break
