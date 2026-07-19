@@ -33,11 +33,15 @@ Options:
                         (header packet + all following row packets up to the next
                         header) is treated as one unit.  Compatible with --loop
                         and --vbi-lines.
-    --magazine-parallel Re-order emitted packets so each magazine always maps to
-                        stable VBI lines, with bandwidth proportional to the
-                        number of pages in that magazine.  Low-traffic magazines
-                        may share a VBI line, taking turns on it.  Compatible
-                        with --loop; incompatible with --interleave.
+    --magazine-parallel Re-order emitted packets so bandwidth across available
+                        VBI lines is proportional to each magazine's page count.
+                        Lines are not locked to magazines; any line may carry any
+                        magazine's packet.  If a header for a magazine is emitted
+                        in a field, no further packets for that magazine follow in
+                        the same field — other magazines fill those remaining
+                        slots instead, or a filler packet is used when no other
+                        magazine has a packet available.
+                        Compatible with --loop; incompatible with --interleave.
     --vbi-lines N       Total number of VBI lines available.  Used by both
                         --magazine-parallel and --interleave.  Default: 8.
 """
@@ -360,8 +364,8 @@ def restream(input_file, mask, time_format, loop, output=None,
         return
 
     if magazine_parallel:
-        _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                                 vbi_lines, control_overrides)
+        _restream_magazine_parallel(input_file, mask, time_format, loop, output,
+                                    vbi_lines, control_overrides)
         return
 
     with open(input_file, 'rb') as f:
@@ -466,62 +470,18 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
             break
 
 
-def _build_vbi_schedule(page_counts_by_mag, vbi_lines):
+def _credit_weights(page_counts_by_mag):
     """
-    Return a list of length *vbi_lines* where each element is a list of
-    magazine numbers assigned to that VBI line slot.
+    Return a dict mapping magazine → fractional credit earned per VBI slot.
 
-    Bandwidth is proportional to page count.  The schedule is built using
-    the Bresenham / largest-remainder method so each magazine appears in
-    exactly round(share) slots; magazines whose share is less than 0.5 share
-    a slot with other low-traffic magazines via round-robin.
-
-    The returned slot list is stable: re-calling with the same inputs always
-    produces the same assignment.
+    Each slot the magazine earns page_count/total_pages credits.  Over time
+    a magazine that earns W credits per slot will be served W * vbi_lines
+    packets per field on average — exactly proportional to its page count.
     """
-    magazines = sorted(page_counts_by_mag)
-    total_pages = sum(page_counts_by_mag.values())
-
-    if total_pages == 0 or not magazines:
-        return [[] for _ in range(vbi_lines)]
-
-    # Compute exact floating share and round to nearest integer (>= 0).
-    exact = {mag: page_counts_by_mag[mag] / total_pages * vbi_lines
-             for mag in magazines}
-    floored = {mag: int(exact[mag]) for mag in magazines}
-    remainders = sorted(magazines,
-                        key=lambda m: exact[m] - floored[m],
-                        reverse=True)
-    allocated = dict(floored)
-    deficit = vbi_lines - sum(allocated.values())
-    for mag in remainders[:deficit]:
-        allocated[mag] += 1
-
-    # Build the slot list: magazines with >= 1 whole slot get that many
-    # consecutive slots.  Magazines with 0 slots are queued to share slots.
-    slots = []
-    sharing_queue = []   # magazines that got 0 whole slots
-    for mag in magazines:
-        n = allocated[mag]
-        if n >= 1:
-            for _ in range(n):
-                slots.append([mag])
-        else:
-            sharing_queue.append(mag)
-
-    # Distribute shared magazines into existing slots, preferring the highest-
-    # indexed slot with the fewest tenants so that the primary (lowest) line for
-    # each magazine stays unshared where possible.
-    for mag in sharing_queue:
-        # Reverse the index range so that ties resolve to the highest slot.
-        target = min(reversed(range(len(slots))), key=lambda i: len(slots[i]))
-        slots[target].append(mag)
-
-    # Pad to vbi_lines if rounding left us short (shouldn't happen, but be safe)
-    while len(slots) < vbi_lines:
-        slots.append([])
-
-    return slots
+    total = sum(page_counts_by_mag.values())
+    if total == 0:
+        return {mag: 0.0 for mag in page_counts_by_mag}
+    return {mag: count / total for mag, count in page_counts_by_mag.items()}
 
 
 def _make_filler_packet(magazine):
@@ -534,58 +494,24 @@ def _make_filler_packet(magazine):
     ])
 
 
-def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
-                     mask, time_format, control_overrides,
-                     loop, max_cycles, cycle_count_by_mag, filler_packets,
-                     primary_line, current_line_idx, header_emitted_this_field,
-                     output):
-    """
-    Emit the next packet for *magazine* and advance its state.
-
-    If the next packet to emit is a page header (packet_number == 0) and
-    *current_line_idx* is not this magazine's primary line, a filler packet is
-    emitted instead and the state is left unchanged so the header is deferred
-    to the next turn when the primary line is active.
-
-    If a header was already emitted for *magazine* earlier in the current field
-    (tracked via *header_emitted_this_field*), a filler packet is emitted and
-    state is left unchanged so that content packets don't appear in the same
-    field as their header.
-
-    Removes the magazine from *active_magazines* when its run is complete
-    (only relevant when loop=False).
-    """
-    if magazine not in active_magazines:
-        return
-
-    slots = slots_by_mag[magazine]
-    state = state_by_mag[magazine]
+def _next_packet_for_mag(mag, state_by_mag, slots_by_mag):
+    """Return the (packet_bytes, packet_number) for *mag* without advancing state."""
+    state = state_by_mag[mag]
+    slots = slots_by_mag[mag]
     slot = slots[state['slot']]
     page_packets = slot[state['subpage'] % len(slot)]
     packet = page_packets[state['packet']]
     _, packet_number = _parse_packet_address(packet)
+    return packet, packet_number
 
-    # If this is a header packet and we are not on the magazine's primary line,
-    # emit a filler instead and leave state unchanged.
-    if packet_number == 0 and current_line_idx != primary_line[magazine]:
-        output.write(filler_packets[magazine])
-        output.flush()
-        return
 
-    # If the header for the current page (identified by slot+subpage) was already
-    # emitted in this field, hold off on its content packets until the next field.
-    page_key = (magazine, state['slot'], state['subpage'] % len(slot))
-    if packet_number != 0 and page_key in header_emitted_this_field:
-        output.write(filler_packets[magazine])
-        output.flush()
-        return
-
-    if packet_number == 0:
-        packet = _apply_time_to_header(packet, mask, time_format,
-                                       control_overrides)
-        header_emitted_this_field.add(page_key)
-    output.write(packet)
-    output.flush()
+def _advance_mag_state(mag, state_by_mag, slots_by_mag,
+                       active_magazines, cycle_count_by_mag, max_cycles, loop):
+    """Advance the cursor for *mag* after one packet has been emitted."""
+    state = state_by_mag[mag]
+    slots = slots_by_mag[mag]
+    slot = slots[state['slot']]
+    page_packets = slot[state['subpage'] % len(slot)]
 
     state['packet'] += 1
     if state['packet'] < len(page_packets):
@@ -599,20 +525,31 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
     state['slot'] = 0
     state['subpage'] += 1
 
-    wrapped = all(state['subpage'] >= len(slot) for slot in slots)
-    if wrapped:
+    if all(state['subpage'] >= len(s) for s in slots):
         state['subpage'] = 0
-        cycle_count_by_mag[magazine] += 1
-        if not loop and cycle_count_by_mag[magazine] >= max_cycles:
-            active_magazines.discard(magazine)
+        cycle_count_by_mag[mag] += 1
+        if not loop and cycle_count_by_mag[mag] >= max_cycles:
+            active_magazines.discard(mag)
 
 
-def _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                             vbi_lines=8, control_overrides=None):
+def _restream_magazine_parallel(input_file, mask, time_format, loop, output,
+                                 vbi_lines=8, control_overrides=None):
     """
-    Emit packets proportionally by magazine page count, pinned to stable VBI
-    lines.  Header packets are always emitted on the magazine's lowest (primary)
-    VBI line; filler packets are used on other lines when a header is pending.
+    Emit packets proportionally by magazine page count across available VBI
+    lines using deficit round-robin (DRR) scheduling.
+
+    Each slot, every active magazine earns page_count/total_pages credits.
+    The magazine with the highest accumulated credit (that is not locked out)
+    is served.  Any unspent credit carries forward into the next field, so
+    proportions are exact over time even though a single field may be heavily
+    skewed toward one magazine.
+
+    Each field is exactly *vbi_lines* packets wide.  Filler is only emitted
+    when every active magazine has already sent a header this field and is
+    therefore locked out for its remaining slots.
+
+    The rule enforced: once a header for magazine M is emitted in a field, no
+    further packets for M appear in that same field.
     """
     while True:
         pages_by_mag = _read_pages_by_magazine(input_file)
@@ -622,16 +559,12 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
             continue
 
         page_counts = {mag: len(pages) for mag, pages in pages_by_mag.items()}
-        vbi_schedule = _build_vbi_schedule(page_counts, vbi_lines)
+        weights = _credit_weights(page_counts)
+        all_mags = sorted(pages_by_mag)
 
-        # Lowest line index assigned to each magazine — headers go here only
-        primary_line = {}
-        for line_idx, line_mags in enumerate(vbi_schedule):
-            for mag in line_mags:
-                if mag not in primary_line:
-                    primary_line[mag] = line_idx
-
+        # Pre-build one filler per magazine for use when all mags are locked out
         filler_packets = {mag: _make_filler_packet(mag) for mag in pages_by_mag}
+        default_filler = filler_packets[all_mags[0]]
 
         slots_by_mag = {
             mag: _group_pages_into_slots(pages_by_mag[mag])
@@ -643,29 +576,54 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
         max_cycles = max(max(len(slot) for slot in slots)
                          for slots in slots_by_mag.values())
 
-        # Per-VBI-line round-robin index for shared slots
-        slot_turn = [0] * vbi_lines
-
         active_magazines = set(slots_by_mag)
+        # Each magazine starts with its weight as initial credit so that all
+        # magazines are eligible immediately on the first slot.
+        credits = {mag: weights[mag] for mag in all_mags}
+
         while active_magazines:
-            header_emitted_this_field = set()
-            for line_idx, line_mags in enumerate(vbi_schedule):
-                if not line_mags:
-                    continue
-                # Pick which magazine takes this line this frame
-                turn = slot_turn[line_idx] % len(line_mags)
-                mag = line_mags[turn]
-                slot_turn[line_idx] += 1
+            # Mags that have already emitted a header this field — locked out
+            # for the remainder of the field.
+            header_emitted = set()
 
-                if mag not in active_magazines:
+            for _ in range(vbi_lines):
+                # Accrue one slot's worth of credits for every active magazine.
+                for mag in active_magazines:
+                    credits[mag] += weights[mag]
+
+                # Pick the active, unlocked magazine with the highest credit.
+                chosen = None
+                best = -1.0
+                for mag in all_mags:
+                    if mag not in active_magazines:
+                        continue
+                    if mag in header_emitted:
+                        continue
+                    if credits[mag] > best:
+                        best = credits[mag]
+                        chosen = mag
+
+                if chosen is None:
+                    # All active mags locked out this field — emit filler.
+                    output.write(default_filler)
+                    output.flush()
                     continue
 
-                _emit_one_packet(mag, state_by_mag, slots_by_mag,
-                                 active_magazines, mask, time_format,
-                                 control_overrides, loop, max_cycles,
-                                 cycle_count_by_mag, filler_packets,
-                                 primary_line, line_idx,
-                                 header_emitted_this_field, output)
+                credits[chosen] -= 1.0
+
+                packet, packet_number = _next_packet_for_mag(
+                    chosen, state_by_mag, slots_by_mag)
+
+                if packet_number == 0:
+                    packet = _apply_time_to_header(packet, mask, time_format,
+                                                   control_overrides)
+                    header_emitted.add(chosen)
+
+                output.write(packet)
+                output.flush()
+                _advance_mag_state(chosen, state_by_mag, slots_by_mag,
+                                   active_magazines, cycle_count_by_mag,
+                                   max_cycles, loop)
 
         if not loop:
             break
