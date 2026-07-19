@@ -528,8 +528,10 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
     packet_size = 42
     packet_count = 0
     filtered_count = 0
-    current_page_matches = False
-    current_page_hex = None
+    # Per-magazine tracking so that a new header on magazine N doesn't
+    # prematurely clear the "matches" flag for a different magazine.
+    mag_page_matches = {}   # magazine → bool
+    mag_page_hex = {}       # magazine → current page hex string
     page_appearance_counts = {}
     # Per-magazine store of packets for the current page (0-25 → raw bytes).
     # Keyed by magazine number (1-8).  Reset on each new page header.
@@ -559,12 +561,18 @@ def process_t42_file(filename, filter_magazine=None, decode_data=False, filter_p
                             mag_page_packets[magazine] = {}
                         mag_page_packets[magazine][packet_number] = bytes(packet)
 
-                lines, current_page_matches, current_page_hex = _describe_packet(
+                mag = magazine  # may be None; handled inside _describe_packet
+                lines, new_matches, new_hex = _describe_packet(
                     packet, packet_count, magazine, packet_number,
-                    decode_data, page_appearance_counts, current_page_matches,
-                    filter_magazine, filter_page, current_page_hex,
+                    decode_data, page_appearance_counts,
+                    mag_page_matches.get(mag, False),
+                    filter_magazine, filter_page,
+                    mag_page_hex.get(mag),
                     page_packets=mag_page_packets.get(magazine) if magazine is not None else None,
                 )
+                if mag is not None:
+                    mag_page_matches[mag] = new_matches
+                    mag_page_hex[mag] = new_hex
                 for line in lines:
                     print(line)
                 if lines:
