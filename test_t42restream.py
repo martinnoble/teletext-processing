@@ -346,5 +346,117 @@ class TestRestreamMagazineParallel(unittest.TestCase):
         self.assertEqual(packet_numbers, [0, "FILLER", 1])
 
 
+class TestRestreamInterleaved(unittest.TestCase):
+    def _make_packet(self, magazine, packet_number, fill_byte):
+        combined = (packet_number << 3) | (magazine & 0x07)
+        packet = bytearray([fill_byte] * t42restream.PACKET_SIZE)
+        packet[0] = hamming_8_4_encode(combined & 0x0F)
+        packet[1] = hamming_8_4_encode((combined >> 4) & 0x0F)
+        return bytes(packet)
+
+    def _make_header_packet(self, magazine, page_hex, fill_byte, subcode=0):
+        packet = bytearray(self._make_packet(magazine, 0, fill_byte))
+        packet[2] = hamming_8_4_encode(int(page_hex[2], 16))
+        packet[3] = hamming_8_4_encode(int(page_hex[1], 16))
+        packet[4] = hamming_8_4_encode(subcode & 0x0F)
+        packet[5] = hamming_8_4_encode((subcode >> 4) & 0x07)
+        packet[6] = hamming_8_4_encode((subcode >> 7) & 0x0F)
+        packet[7] = hamming_8_4_encode((subcode >> 11) & 0x03)
+        return bytes(packet)
+
+    def test_interleave_no_content_in_same_field_as_header(self):
+        """
+        In interleave mode, content packets of a page must not appear in the
+        same VBI field as the page's own header packet.
+
+        With vbi_lines=4, a page that has header + 1 content row should produce:
+          Field 1: header, filler, filler, filler   (3 fillers pad to field boundary)
+          Field 2: content-row, ...                 (content starts in next field)
+        """
+        packets = [
+            self._make_header_packet(1, "110", 0x22),
+            self._make_packet(1, 1, 0x23),
+        ]
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(b"".join(packets))
+            temp_path = temp_file.name
+
+        try:
+            output = BytesIO()
+            t42restream.restream(
+                temp_path,
+                mask="?" * t42restream.HEADER_TEXT_LEN,
+                time_format="",
+                loop=False,
+                output=output,
+                interleave=True,
+                vbi_lines=4,
+            )
+        finally:
+            os.unlink(temp_path)
+
+        emitted = output.getvalue()
+        pkt_size = t42restream.PACKET_SIZE
+        emitted_packets = [
+            emitted[i:i + pkt_size]
+            for i in range(0, len(emitted), pkt_size)
+        ]
+
+        filler_mag1 = bytes([
+            hamming_8_4_encode(((25 << 3) | 1) & 0x0F),
+            hamming_8_4_encode((((25 << 3) | 1) >> 4) & 0x0F),
+            *([t42restream.encode_text_byte(' ')] * (pkt_size - 2)),
+        ])
+
+        labels = []
+        for pkt in emitted_packets:
+            if pkt == filler_mag1:
+                labels.append("FILLER")
+            else:
+                _, pn = t42restream._parse_packet_address(pkt)
+                labels.append(pn)
+
+        # Field 1: header at slot 0, then 3 fillers to complete the 4-line field.
+        # Field 2: content row (pn=1) at slot 0.
+        self.assertEqual(labels, [0, "FILLER", "FILLER", "FILLER", 1])
+
+    def test_interleave_header_only_page_no_padding(self):
+        """
+        A header-only page (no content rows) should not produce any filler
+        padding after the header within the same field.  The next page's header
+        will still be aligned to the start of the next field, but no padding is
+        inserted when there are no content packets to separate.
+        """
+        packets = [
+            self._make_header_packet(1, "110", 0x22),
+        ]
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(b"".join(packets))
+            temp_path = temp_file.name
+
+        try:
+            output = BytesIO()
+            t42restream.restream(
+                temp_path,
+                mask="?" * t42restream.HEADER_TEXT_LEN,
+                time_format="",
+                loop=False,
+                output=output,
+                interleave=True,
+                vbi_lines=4,
+            )
+        finally:
+            os.unlink(temp_path)
+
+        emitted = output.getvalue()
+        pkt_size = t42restream.PACKET_SIZE
+        # Single header-only page: just the one header, no filler appended.
+        self.assertEqual(len(emitted), pkt_size)
+        _, pn = t42restream._parse_packet_address(emitted[:pkt_size])
+        self.assertEqual(pn, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

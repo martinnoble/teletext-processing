@@ -31,14 +31,15 @@ Options:
                         magazines are interleaved round-robin rather than output
                         in the order they appear in the file.  Each complete page
                         (header packet + all following row packets up to the next
-                        header) is treated as one unit.  Compatible with --loop.
+                        header) is treated as one unit.  Compatible with --loop
+                        and --vbi-lines.
     --magazine-parallel Re-order emitted packets so each magazine always maps to
                         stable VBI lines, with bandwidth proportional to the
                         number of pages in that magazine.  Low-traffic magazines
                         may share a VBI line, taking turns on it.  Compatible
                         with --loop; incompatible with --interleave.
-    --vbi-lines N       Total number of VBI lines available when using
-                        --magazine-parallel.  Default: 8.
+    --vbi-lines N       Total number of VBI lines available.  Used by both
+                        --magazine-parallel and --interleave.  Default: 8.
 """
 
 import sys
@@ -355,7 +356,7 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if interleave:
         _restream_interleaved(input_file, mask, time_format, loop, output,
-                              control_overrides)
+                              vbi_lines, control_overrides)
         return
 
     if magazine_parallel:
@@ -396,13 +397,18 @@ def restream(input_file, mask, time_format, loop, output=None,
 
 
 def _restream_interleaved(input_file, mask, time_format, loop, output,
-                         control_overrides=None):
+                          vbi_lines=8, control_overrides=None):
     """
     Emit packets from *input_file* interleaved round-robin by magazine.
 
     On each pass through the file all pages are bucketed by magazine; pages
     are then emitted one-at-a-time cycling through magazines in sorted order.
     When *loop* is True this repeats indefinitely.
+
+    A VBI "field" is *vbi_lines* packets wide.  The header packet of each page
+    is emitted at the start of a fresh field.  Any remaining capacity in that
+    field is padded with filler packets so that content packets of the same page
+    never share a field with their own header.
     """
     while True:
         pages_by_mag = _read_pages_by_magazine(input_file)
@@ -411,14 +417,50 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
                 break
             continue
 
+        # Build filler packets keyed by magazine number.
+        filler_packets = {mag: _make_filler_packet(mag) for mag in pages_by_mag}
+
+        # Track how many packets have been emitted into the current field so we
+        # know when we cross a field boundary.
+        packets_in_field = 0
+
         for page_packets in _interleave_pages(pages_by_mag):
+            magazine, _ = _parse_packet_address(page_packets[0])
+
+            # Pad to the next field boundary before the header so the header
+            # always lands at position 0 within a field.
+            if packets_in_field > 0:
+                padding = vbi_lines - packets_in_field
+                filler = filler_packets.get(magazine, filler_packets[next(iter(filler_packets))])
+                for _ in range(padding):
+                    output.write(filler)
+                    output.flush()
+                packets_in_field = 0
+
+            # Emit the header (position 0 of this field).
             header = _apply_time_to_header(page_packets[0], mask, time_format,
                                            control_overrides)
             output.write(header)
             output.flush()
-            for pkt in page_packets[1:]:
-                output.write(pkt)
-                output.flush()
+            packets_in_field = 1
+
+            # If there are content packets, pad the rest of this field with
+            # fillers so content starts in the next field.
+            if len(page_packets) > 1:
+                padding = vbi_lines - packets_in_field
+                filler = filler_packets.get(magazine, filler_packets[next(iter(filler_packets))])
+                for _ in range(padding):
+                    output.write(filler)
+                    output.flush()
+                packets_in_field = 0
+
+                # Emit content packets, advancing the field counter.
+                for pkt in page_packets[1:]:
+                    output.write(pkt)
+                    output.flush()
+                    packets_in_field += 1
+                    if packets_in_field >= vbi_lines:
+                        packets_in_field = 0
 
         if not loop:
             break
