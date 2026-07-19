@@ -41,9 +41,12 @@ Options:
                         incompatible with --magazine / --page filters (those
                         options are ignored when --interleave is set).
     --magazine-parallel Re-order emitted packets so each magazine always maps to
-                        the same one of 8 VBI lines. Packets are emitted round-
-                        robin by magazine instead of file order. Compatible with
-                        --loop; incompatible with --interleave.
+                        stable VBI lines, with bandwidth proportional to the
+                        number of pages in that magazine.  Low-traffic magazines
+                        may share a VBI line, taking turns on it.  Compatible
+                        with --loop; incompatible with --interleave.
+    --vbi-lines N       Total number of VBI lines available when using
+                        --magazine-parallel.  Default: 8.
 """
 
 import sys
@@ -339,7 +342,7 @@ def _group_pages_into_slots(pages):
 
 def restream(input_file, mask, time_format, loop, output=None,
              filter_magazine=None, filter_page=None, interleave=False,
-             magazine_parallel=False, control_overrides=None,
+             magazine_parallel=False, vbi_lines=8, control_overrides=None,
              suppressed_packet_numbers=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
@@ -357,8 +360,10 @@ def restream(input_file, mask, time_format, loop, output=None,
         filter_page: if not None, only emit packets for this page (e.g. '172')
         interleave: if True, re-order the stream so pages from different
                     magazines are interleaved round-robin
-        magazine_parallel: if True, emit packets round-robin by magazine so each
-                           magazine stays on a stable VBI line
+        magazine_parallel: if True, emit packets with bandwidth proportional to
+                           each magazine's page count, pinned to stable VBI lines.
+                           Low-traffic magazines may share a line.
+        vbi_lines: total VBI lines to distribute across magazines (default 8)
         control_overrides: optional dict mapping control names (C4-C11) to 0/1
         suppressed_packet_numbers: optional set of packet numbers (0-31) to drop
     """
@@ -380,7 +385,7 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if magazine_parallel:
         _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                                 control_overrides, suppressed_packet_numbers)
+                                 vbi_lines, control_overrides, suppressed_packet_numbers)
         return
 
     # Normalise filter_page to uppercase for comparison
@@ -494,9 +499,115 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
             break
 
 
+def _build_vbi_schedule(page_counts_by_mag, vbi_lines):
+    """
+    Return a list of length *vbi_lines* where each element is a list of
+    magazine numbers assigned to that VBI line slot.
+
+    Bandwidth is proportional to page count.  The schedule is built using
+    the Bresenham / largest-remainder method so each magazine appears in
+    exactly round(share) slots; magazines whose share is less than 0.5 share
+    a slot with other low-traffic magazines via round-robin.
+
+    The returned slot list is stable: re-calling with the same inputs always
+    produces the same assignment.
+    """
+    magazines = sorted(page_counts_by_mag)
+    total_pages = sum(page_counts_by_mag.values())
+
+    if total_pages == 0 or not magazines:
+        return [[] for _ in range(vbi_lines)]
+
+    # Compute exact floating share and round to nearest integer (>= 0).
+    exact = {mag: page_counts_by_mag[mag] / total_pages * vbi_lines
+             for mag in magazines}
+    floored = {mag: int(exact[mag]) for mag in magazines}
+    remainders = sorted(magazines,
+                        key=lambda m: exact[m] - floored[m],
+                        reverse=True)
+    allocated = dict(floored)
+    deficit = vbi_lines - sum(allocated.values())
+    for mag in remainders[:deficit]:
+        allocated[mag] += 1
+
+    # Build the slot list: magazines with >= 1 whole slot get that many
+    # consecutive slots.  Magazines with 0 slots are queued to share slots.
+    slots = []
+    sharing_queue = []   # magazines that got 0 whole slots
+    for mag in magazines:
+        n = allocated[mag]
+        if n >= 1:
+            for _ in range(n):
+                slots.append([mag])
+        else:
+            sharing_queue.append(mag)
+
+    # Distribute shared magazines into existing slots round-robin by slot index,
+    # preferring slots that currently have fewer tenants.
+    for mag in sharing_queue:
+        # Pick the slot with the fewest current occupants (stable: leftmost wins)
+        target = min(range(len(slots)), key=lambda i: len(slots[i]))
+        slots[target].append(mag)
+
+    # Pad to vbi_lines if rounding left us short (shouldn't happen, but be safe)
+    while len(slots) < vbi_lines:
+        slots.append([])
+
+    return slots
+
+
+def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
+                     mask, time_format, control_overrides,
+                     suppressed_packet_numbers, loop, max_cycles,
+                     cycle_count_by_mag, output):
+    """
+    Emit the next packet for *magazine* and advance its state.
+    Removes the magazine from *active_magazines* when its run is complete
+    (only relevant when loop=False).
+    """
+    if magazine not in active_magazines:
+        return
+
+    slots = slots_by_mag[magazine]
+    state = state_by_mag[magazine]
+    slot = slots[state['slot']]
+    page_packets = slot[state['subpage'] % len(slot)]
+    packet = page_packets[state['packet']]
+    _, packet_number = _parse_packet_address(packet)
+    if not (suppressed_packet_numbers and packet_number in suppressed_packet_numbers):
+        if packet_number == 0:
+            packet = _apply_time_to_header(packet, mask, time_format,
+                                           control_overrides)
+        output.write(packet)
+        output.flush()
+
+    state['packet'] += 1
+    if state['packet'] < len(page_packets):
+        return
+
+    state['packet'] = 0
+    state['slot'] += 1
+    if state['slot'] < len(slots):
+        return
+
+    state['slot'] = 0
+    state['subpage'] += 1
+
+    wrapped = all(state['subpage'] >= len(slot) for slot in slots)
+    if wrapped:
+        state['subpage'] = 0
+        cycle_count_by_mag[magazine] += 1
+        if not loop and cycle_count_by_mag[magazine] >= max_cycles:
+            active_magazines.discard(magazine)
+
+
 def _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                             control_overrides=None, suppressed_packet_numbers=None):
-    """Emit packets by magazine with pages ordered numerically and sub-pages stepped in parallel."""
+                             vbi_lines=8, control_overrides=None,
+                             suppressed_packet_numbers=None):
+    """
+    Emit packets proportionally by magazine page count, pinned to stable VBI
+    lines.  Low-traffic magazines share a line, taking turns on it each frame.
+    """
     while True:
         pages_by_mag = _read_pages_by_magazine(input_file)
         if not pages_by_mag:
@@ -504,70 +615,39 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
                 break
             continue
 
-        magazines = list(range(1, 9))
+        page_counts = {mag: len(pages) for mag, pages in pages_by_mag.items()}
+        vbi_schedule = _build_vbi_schedule(page_counts, vbi_lines)
+
         slots_by_mag = {
-            magazine: _group_pages_into_slots(pages_by_mag[magazine])
-            for magazine in pages_by_mag
+            mag: _group_pages_into_slots(pages_by_mag[mag])
+            for mag in pages_by_mag
         }
-        state_by_mag = {magazine: {'slot': 0, 'subpage': 0, 'packet': 0} for magazine in slots_by_mag}
-        cycle_count_by_mag = {magazine: 0 for magazine in slots_by_mag}
-        max_cycles = max(max(len(slot) for slot in slots) for slots in slots_by_mag.values())
-        filler_packets = {
-            magazine: bytes([
-                hamming_8_4_encode(((25 << 3) | (magazine & 0x07)) & 0x0F),
-                hamming_8_4_encode((((25 << 3) | (magazine & 0x07)) >> 4) & 0x0F),
-                *([encode_text_byte(' ')] * (PACKET_SIZE - 2)),
-            ])
-            for magazine in magazines
-        }
+        state_by_mag = {mag: {'slot': 0, 'subpage': 0, 'packet': 0}
+                        for mag in slots_by_mag}
+        cycle_count_by_mag = {mag: 0 for mag in slots_by_mag}
+        max_cycles = max(max(len(slot) for slot in slots)
+                         for slots in slots_by_mag.values())
+
+        # Per-VBI-line round-robin index for shared slots
+        slot_turn = [0] * vbi_lines
 
         active_magazines = set(slots_by_mag)
         while active_magazines:
-            for magazine in magazines:
-                if magazine not in slots_by_mag:
-                    if active_magazines:
-                        output.write(filler_packets[magazine])
-                        output.flush()
+            for line_idx, line_mags in enumerate(vbi_schedule):
+                if not line_mags:
+                    continue
+                # Pick which magazine takes this line this frame
+                turn = slot_turn[line_idx] % len(line_mags)
+                mag = line_mags[turn]
+                slot_turn[line_idx] += 1
+
+                if mag not in active_magazines:
                     continue
 
-                if magazine not in active_magazines:
-                    continue
-
-                slots = slots_by_mag[magazine]
-                state = state_by_mag[magazine]
-                slot = slots[state['slot']]
-                page_packets = slot[state['subpage'] % len(slot)]
-                packet = page_packets[state['packet']]
-                _, packet_number = _parse_packet_address(packet)
-                if not (suppressed_packet_numbers and packet_number in suppressed_packet_numbers):
-                    if packet_number == 0:
-                        packet = _apply_time_to_header(packet, mask, time_format,
-                                                       control_overrides)
-                    output.write(packet)
-                    output.flush()
-
-                state['packet'] += 1
-                if state['packet'] < len(page_packets):
-                    continue
-
-                state['packet'] = 0
-                state['slot'] += 1
-                if state['slot'] < len(slots):
-                    continue
-
-                state['slot'] = 0
-                state['subpage'] += 1
-
-                wrapped = True
-                for slot in slots:
-                    if state['subpage'] < len(slot):
-                        wrapped = False
-                        break
-                if wrapped:
-                    state['subpage'] = 0
-                    cycle_count_by_mag[magazine] += 1
-                    if not loop and cycle_count_by_mag[magazine] >= max_cycles:
-                        active_magazines.remove(magazine)
+                _emit_one_packet(mag, state_by_mag, slots_by_mag,
+                                 active_magazines, mask, time_format,
+                                 control_overrides, suppressed_packet_numbers,
+                                 loop, max_cycles, cycle_count_by_mag, output)
 
         if not loop:
             break
@@ -607,6 +687,7 @@ def main():
     filter_page = None
     interleave = False
     magazine_parallel = False
+    vbi_lines = 8
     control_overrides = {}
     suppressed_packet_numbers = set()
 
@@ -653,6 +734,19 @@ def main():
         elif arg == "--magazine-parallel":
             magazine_parallel = True
             i += 1
+        elif arg == "--vbi-lines":
+            if i + 1 >= len(sys.argv):
+                print("Error: --vbi-lines requires an argument", file=sys.stderr)
+                sys.exit(1)
+            try:
+                vbi_lines = int(sys.argv[i + 1])
+                if vbi_lines < 1:
+                    print("Error: --vbi-lines must be at least 1", file=sys.stderr)
+                    sys.exit(1)
+            except ValueError:
+                print("Error: --vbi-lines argument must be an integer", file=sys.stderr)
+                sys.exit(1)
+            i += 2
         elif arg == "--suppress-packet":
             if i + 1 >= len(sys.argv):
                 print("Error: --suppress-packet requires an argument", file=sys.stderr)
@@ -690,7 +784,7 @@ def main():
         restream(input_file, mask, time_format, loop,
                  filter_magazine=filter_magazine, filter_page=filter_page,
                  interleave=interleave, magazine_parallel=magazine_parallel,
-                 control_overrides=control_overrides,
+                 vbi_lines=vbi_lines, control_overrides=control_overrides,
                  suppressed_packet_numbers=suppressed_packet_numbers)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
