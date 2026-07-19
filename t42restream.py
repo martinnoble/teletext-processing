@@ -27,19 +27,11 @@ Options:
                         interrupted-sequence, inhibit-display, magazine-serial.
                         VAL may be 0/off/false or 1/on/true.
     --loop              Loop through the file indefinitely (streams continuously).
-    --suppress-packet N Suppress all packets with packet number N (0-31).
-                        May be supplied multiple times.
-    --magazine MAG      Only stream packets from this magazine number (1-8).
-    --page PAGE         Only stream packets for this page number (e.g. 172, 1BA).
-                        Implies --magazine is set to the magazine of that page if
-                        --magazine is not supplied explicitly.
     --interleave        Re-order the output stream so that pages from different
                         magazines are interleaved round-robin rather than output
                         in the order they appear in the file.  Each complete page
                         (header packet + all following row packets up to the next
-                        header) is treated as one unit.  Compatible with --loop;
-                        incompatible with --magazine / --page filters (those
-                        options are ignored when --interleave is set).
+                        header) is treated as one unit.  Compatible with --loop.
     --magazine-parallel Re-order emitted packets so each magazine always maps to
                         stable VBI lines, with bandwidth proportional to the
                         number of pages in that magazine.  Low-traffic magazines
@@ -104,19 +96,6 @@ def _parse_packet_address(packet_data):
         magazine = 8
     packet_number = (combined >> 3) & 0x1F
     return magazine, packet_number
-
-
-def _parse_page_hex(packet_data, magazine):
-    """
-    Return the page identifier string (e.g. '172') for a header packet,
-    or None if the page bytes cannot be decoded.
-    Requires packet_data to be a full PACKET_SIZE-byte header packet.
-    """
-    page_units = hamming_8_4_decode(packet_data[2])
-    page_tens = hamming_8_4_decode(packet_data[3])
-    if page_units is None or page_tens is None:
-        return None
-    return f"{magazine:X}{page_tens:X}{page_units:X}"
 
 
 def _parse_page_sort_key(header_packet):
@@ -341,9 +320,8 @@ def _group_pages_into_slots(pages):
 
 
 def restream(input_file, mask, time_format, loop, output=None,
-             filter_magazine=None, filter_page=None, interleave=False,
-             magazine_parallel=False, vbi_lines=8, control_overrides=None,
-             suppressed_packet_numbers=None):
+             interleave=False, magazine_parallel=False, vbi_lines=8,
+             control_overrides=None):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -356,8 +334,6 @@ def restream(input_file, mask, time_format, loop, output=None,
         time_format: strftime format string
         loop: if True, seek back to the start of the file after reaching EOF
         output: writable binary stream; defaults to sys.stdout.buffer
-        filter_magazine: if not None, only emit packets from this magazine (1-8)
-        filter_page: if not None, only emit packets for this page (e.g. '172')
         interleave: if True, re-order the stream so pages from different
                     magazines are interleaved round-robin
         magazine_parallel: if True, emit packets with bandwidth proportional to
@@ -365,7 +341,6 @@ def restream(input_file, mask, time_format, loop, output=None,
                            Low-traffic magazines may share a line.
         vbi_lines: total VBI lines to distribute across magazines (default 8)
         control_overrides: optional dict mapping control names (C4-C11) to 0/1
-        suppressed_packet_numbers: optional set of packet numbers (0-31) to drop
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -380,28 +355,13 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if interleave:
         _restream_interleaved(input_file, mask, time_format, loop, output,
-                              control_overrides, suppressed_packet_numbers)
+                              control_overrides)
         return
 
     if magazine_parallel:
         _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                                 vbi_lines, control_overrides, suppressed_packet_numbers)
+                                 vbi_lines, control_overrides)
         return
-
-    # Normalise filter_page to uppercase for comparison
-    filter_page_upper = filter_page.upper() if filter_page is not None else None
-
-    # When filtering by page, derive the magazine from the page prefix so that
-    # inter-magazine packets are also suppressed correctly.
-    if filter_page_upper is not None and filter_magazine is None:
-        try:
-            filter_magazine = int(filter_page_upper[0], 16)
-            if filter_magazine == 0:
-                filter_magazine = 8
-        except (ValueError, IndexError):
-            pass
-
-    current_page_matches = True  # True when no page filter is active
 
     with open(input_file, 'rb') as f:
         while True:
@@ -410,7 +370,6 @@ def restream(input_file, mask, time_format, loop, output=None,
             if len(packet) == 0:
                 if loop:
                     f.seek(0)
-                    current_page_matches = filter_page_upper is None
                     continue
                 break
 
@@ -418,54 +377,26 @@ def restream(input_file, mask, time_format, loop, output=None,
                 # Incomplete trailing packet — skip and optionally loop
                 if loop:
                     f.seek(0)
-                    current_page_matches = filter_page_upper is None
                     continue
                 break
 
             magazine, packet_number = _parse_packet_address(packet)
 
             if magazine is None:
-                # Undecodable address — drop when any filter is active
-                if filter_magazine is None and filter_page_upper is None:
-                    output.write(packet)
-                    output.flush()
-                continue
-
-            # Magazine filter
-            if filter_magazine is not None and magazine != filter_magazine:
-                if packet_number == 0:
-                    current_page_matches = False
-                continue
-
-            if suppressed_packet_numbers and packet_number in suppressed_packet_numbers:
+                output.write(packet)
+                output.flush()
                 continue
 
             if packet_number == 0:
-                # Header packet — determine whether this page passes the filter
-                if filter_page_upper is not None:
-                    page_hex = _parse_page_hex(packet, magazine)
-                    current_page_matches = (page_hex == filter_page_upper)
-                else:
-                    current_page_matches = True
-
-                if current_page_matches:
-                    # Inject current time into header
-                    packet = _apply_time_to_header(packet, mask, time_format,
-                                                   control_overrides)
-                else:
-                    #ensure we don't output non matching header packets
-                    continue
-            else:
-                # Non-header packet — emit only if we are inside a matching page
-                if not current_page_matches:
-                    continue
+                packet = _apply_time_to_header(packet, mask, time_format,
+                                               control_overrides)
 
             output.write(packet)
             output.flush()
 
 
 def _restream_interleaved(input_file, mask, time_format, loop, output,
-                         control_overrides=None, suppressed_packet_numbers=None):
+                         control_overrides=None):
     """
     Emit packets from *input_file* interleaved round-robin by magazine.
 
@@ -481,17 +412,11 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
             continue
 
         for page_packets in _interleave_pages(pages_by_mag):
-            header_packet = page_packets[0]
-            _, header_packet_number = _parse_packet_address(header_packet)
-            if not (suppressed_packet_numbers and header_packet_number in suppressed_packet_numbers):
-                header = _apply_time_to_header(header_packet, mask, time_format,
-                                               control_overrides)
-                output.write(header)
-                output.flush()
+            header = _apply_time_to_header(page_packets[0], mask, time_format,
+                                           control_overrides)
+            output.write(header)
+            output.flush()
             for pkt in page_packets[1:]:
-                _, packet_number = _parse_packet_address(pkt)
-                if suppressed_packet_numbers and packet_number in suppressed_packet_numbers:
-                    continue
                 output.write(pkt)
                 output.flush()
 
@@ -569,9 +494,9 @@ def _make_filler_packet(magazine):
 
 def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
                      mask, time_format, control_overrides,
-                     suppressed_packet_numbers, loop, max_cycles,
-                     cycle_count_by_mag, filler_packets, primary_line,
-                     current_line_idx, header_emitted_this_field, output):
+                     loop, max_cycles, cycle_count_by_mag, filler_packets,
+                     primary_line, current_line_idx, header_emitted_this_field,
+                     output):
     """
     Emit the next packet for *magazine* and advance its state.
 
@@ -581,9 +506,9 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
     to the next turn when the primary line is active.
 
     If a header was already emitted for *magazine* earlier in the current field
-    (tracked via *header_emitted_this_field*), a filler is emitted and state is
-    left unchanged so that content packets don't appear in the same field as
-    their header.
+    (tracked via *header_emitted_this_field*), a filler packet is emitted and
+    state is left unchanged so that content packets don't appear in the same
+    field as their header.
 
     Removes the magazine from *active_magazines* when its run is complete
     (only relevant when loop=False).
@@ -613,13 +538,12 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
         output.flush()
         return
 
-    if not (suppressed_packet_numbers and packet_number in suppressed_packet_numbers):
-        if packet_number == 0:
-            packet = _apply_time_to_header(packet, mask, time_format,
-                                           control_overrides)
-            header_emitted_this_field.add(page_key)
-        output.write(packet)
-        output.flush()
+    if packet_number == 0:
+        packet = _apply_time_to_header(packet, mask, time_format,
+                                       control_overrides)
+        header_emitted_this_field.add(page_key)
+    output.write(packet)
+    output.flush()
 
     state['packet'] += 1
     if state['packet'] < len(page_packets):
@@ -642,8 +566,7 @@ def _emit_one_packet(magazine, state_by_mag, slots_by_mag, active_magazines,
 
 
 def _restream_magazine_lines(input_file, mask, time_format, loop, output,
-                             vbi_lines=8, control_overrides=None,
-                             suppressed_packet_numbers=None):
+                             vbi_lines=8, control_overrides=None):
     """
     Emit packets proportionally by magazine page count, pinned to stable VBI
     lines.  Header packets are always emitted on the magazine's lowest (primary)
@@ -697,9 +620,9 @@ def _restream_magazine_lines(input_file, mask, time_format, loop, output,
 
                 _emit_one_packet(mag, state_by_mag, slots_by_mag,
                                  active_magazines, mask, time_format,
-                                 control_overrides, suppressed_packet_numbers,
-                                 loop, max_cycles, cycle_count_by_mag,
-                                 filler_packets, primary_line, line_idx,
+                                 control_overrides, loop, max_cycles,
+                                 cycle_count_by_mag, filler_packets,
+                                 primary_line, line_idx,
                                  header_emitted_this_field, output)
 
         if not loop:
@@ -736,13 +659,10 @@ def main():
     mask = DEFAULT_MASK
     time_format = DEFAULT_TIME_FORMAT
     loop = False
-    filter_magazine = None
-    filter_page = None
     interleave = False
     magazine_parallel = False
     vbi_lines = 8
     control_overrides = {}
-    suppressed_packet_numbers = set()
 
     i = 2
     while i < len(sys.argv):
@@ -762,25 +682,6 @@ def main():
         elif arg == "--loop":
             loop = True
             i += 1
-        elif arg == "--magazine":
-            if i + 1 >= len(sys.argv):
-                print("Error: --magazine requires an argument", file=sys.stderr)
-                sys.exit(1)
-            try:
-                filter_magazine = int(sys.argv[i + 1])
-                if filter_magazine < 1 or filter_magazine > 8:
-                    print("Error: Magazine number must be between 1 and 8", file=sys.stderr)
-                    sys.exit(1)
-            except ValueError:
-                print("Error: --magazine argument must be an integer", file=sys.stderr)
-                sys.exit(1)
-            i += 2
-        elif arg == "--page":
-            if i + 1 >= len(sys.argv):
-                print("Error: --page requires an argument", file=sys.stderr)
-                sys.exit(1)
-            filter_page = sys.argv[i + 1]
-            i += 2
         elif arg == "--interleave":
             interleave = True
             i += 1
@@ -799,20 +700,6 @@ def main():
             except ValueError:
                 print("Error: --vbi-lines argument must be an integer", file=sys.stderr)
                 sys.exit(1)
-            i += 2
-        elif arg == "--suppress-packet":
-            if i + 1 >= len(sys.argv):
-                print("Error: --suppress-packet requires an argument", file=sys.stderr)
-                sys.exit(1)
-            try:
-                packet_number = int(sys.argv[i + 1])
-            except ValueError:
-                print("Error: --suppress-packet argument must be an integer", file=sys.stderr)
-                sys.exit(1)
-            if packet_number < 0 or packet_number > 31:
-                print("Error: Packet number must be between 0 and 31", file=sys.stderr)
-                sys.exit(1)
-            suppressed_packet_numbers.add(packet_number)
             i += 2
         elif arg == "--control":
             if i + 1 >= len(sys.argv):
@@ -835,10 +722,8 @@ def main():
 
     try:
         restream(input_file, mask, time_format, loop,
-                 filter_magazine=filter_magazine, filter_page=filter_page,
                  interleave=interleave, magazine_parallel=magazine_parallel,
-                 vbi_lines=vbi_lines, control_overrides=control_overrides,
-                 suppressed_packet_numbers=suppressed_packet_numbers)
+                 vbi_lines=vbi_lines, control_overrides=control_overrides)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

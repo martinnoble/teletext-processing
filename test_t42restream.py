@@ -69,7 +69,10 @@ class TestRestreamMagazineParallel(unittest.TestCase):
         ]
         emitted_page_ids = [
             (
-                t42restream._parse_page_hex(packet, t42restream._parse_packet_address(packet)[0]),
+                "%X%X%X" % (
+                    t42restream._parse_packet_address(packet)[0],
+                    *t42restream._parse_page_sort_key(packet)[:2],
+                ),
                 t42restream._parse_page_sort_key(packet)[2],
             )
             for packet in emitted_packets
