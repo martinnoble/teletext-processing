@@ -15,7 +15,7 @@ def _load_channel_config(path):
     Returns a dict mapping channel number (int) to
     {'file': str, 'time_format': str}.
     """
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(interpolation=None)
     cp.read(path)
     config = {}
     for section in cp.sections():
