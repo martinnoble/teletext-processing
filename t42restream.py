@@ -10,45 +10,62 @@ Usage:
     python t42restream.py <input_file> [options]
 
 Options:
-    --mask MASK         32-character mask string for the header text region
-                        (columns 8-39 of the display row).
-                        Use '#' to mark positions that should be replaced with
-                        the formatted time, '?' to leave the original byte
-                        unchanged.
-                        Default: "????????????????????????????????" with the last
-                        8 positions as '#' (i.e. "????????????????????????########")
-    --time-format FMT   strftime format string for the time text that fills the
-                        '#' positions.  The rendered string must be exactly as
-                        long as the number of '#' characters in the mask.
-                        Default: "%H:%M:%S"
-    --control NAME=VAL  Force a page-header control bit on or off.
-                        May be supplied multiple times. NAME may be C4-C11 or:
-                        erase, newsflash, subtitle, suppress-header, update,
-                        interrupted-sequence, inhibit-display, magazine-serial.
-                        VAL may be 0/off/false or 1/on/true.
-    --loop              Loop through the file indefinitely (streams continuously).
-    --interleave        Re-order the output stream so that pages from different
-                        magazines are interleaved round-robin rather than output
-                        in the order they appear in the file.  Each complete page
-                        (header packet + all following row packets up to the next
-                        header) is treated as one unit.  Compatible with --loop
-                        and --vbi-lines.
-    --magazine-parallel Re-order emitted packets so bandwidth across available
-                        VBI lines is proportional to each magazine's page count.
-                        Lines are not locked to magazines; any line may carry any
-                        magazine's packet.  If a header for a magazine is emitted
-                        in a field, no further packets for that magazine follow in
-                        the same field — other magazines fill those remaining
-                        slots instead, or a filler packet is used when no other
-                        magazine has a packet available.
-                        Compatible with --loop; incompatible with --interleave.
-    --vbi-lines N       Total number of VBI lines available.  Used by both
-                        --magazine-parallel and --interleave.  Default: 8.
+    --mask MASK             32-character mask string for the header text region
+                            (columns 8-39 of the display row).
+                            Use '#' to mark positions that should be replaced
+                            with the formatted time, '?' to leave the original
+                            byte unchanged.
+                            Default: "????????????????????????????????" with the
+                            last 8 positions as '#' (i.e.
+                            "????????????????????????########")
+    --time-format FMT       strftime format string for the time text that fills
+                            the '#' positions.  The rendered string must be
+                            exactly as long as the number of '#' characters in
+                            the mask.
+                            Default: "%H:%M:%S"
+    --control NAME=VAL      Force a page-header control bit on or off.
+                            May be supplied multiple times. NAME may be C4-C11
+                            or: erase, newsflash, subtitle, suppress-header,
+                            update, interrupted-sequence, inhibit-display,
+                            magazine-serial.
+                            VAL may be 0/off/false or 1/on/true.
+    --loop                  Loop through the file indefinitely (streams
+                            continuously).
+    --interleave            Re-order the output stream so that pages from
+                            different magazines are interleaved round-robin
+                            rather than output in the order they appear in the
+                            file.  Each complete page (header packet + all
+                            following row packets up to the next header) is
+                            treated as one unit.  Compatible with --loop and
+                            --vbi-lines.
+    --magazine-parallel     Re-order emitted packets so bandwidth across
+                            available VBI lines is proportional to each
+                            magazine's page count.  Lines are not locked to
+                            magazines; any line may carry any magazine's packet.
+                            If a header for a magazine is emitted in a field,
+                            no further packets for that magazine follow in the
+                            same field — other magazines fill those remaining
+                            slots instead, or a filler packet is used when no
+                            other magazine has a packet available.
+                            Compatible with --loop; incompatible with
+                            --interleave.
+    --vbi-lines N           Total number of VBI lines available.  Used by both
+                            --magazine-parallel and --interleave.  Default: 8.
+    --min-subpage-dwell N   Minimum number of seconds a sub-page must be
+                            displayed before advancing to the next sub-page.
+                            If the magazine cycles back to a page before this
+                            time has elapsed, the current sub-page is
+                            re-transmitted instead of moving on.  This
+                            decouples sub-page advancement from transmission
+                            bandwidth.  Applies to --interleave and
+                            --magazine-parallel modes.  Default: 0 (no
+                            minimum; advance on every cycle as before).
 """
 
 import sys
 import os
 import datetime
+import time
 
 from teletext_helpers import hamming_8_4_decode, hamming_8_4_encode, encode_text_byte
 
@@ -253,7 +270,7 @@ def _read_pages_by_magazine(input_file):
     return pages_by_mag
 
 
-def _interleave_pages(pages_by_mag):
+def _interleave_pages(pages_by_mag, min_subpage_dwell=0.0):
     """
     Given a dict of {magazine: [page, ...]}, yield pages interleaved so that
     sub-pages are stepped through one at a time, with magazines interleaved
@@ -268,8 +285,12 @@ def _interleave_pages(pages_by_mag):
     Pages within each magazine are grouped by base page number (tens, units).
     All base-page slots across all magazines are collected into a flat ordered
     list; on each sub-page step every slot yields sub-page index N % len(slot).
-    The outer loop runs max_subpages times (the maximum sub-page count of any
-    single base page).
+    The outer loop runs until all slots have fully cycled through all their
+    sub-pages (respecting min_subpage_dwell if set).
+
+    When min_subpage_dwell > 0, a slot does not advance to the next sub-page
+    until at least min_subpage_dwell seconds have elapsed since that sub-page
+    was first transmitted.  The slot instead re-yields the current sub-page.
 
     Each yielded value is a list[bytes] representing one complete page.
     """
@@ -303,9 +324,44 @@ def _interleave_pages(pages_by_mag):
 
     max_subpages = max(len(slot) for slot in slots)
 
-    for subpage_idx in range(max_subpages):
-        for slot in slots:
-            yield slot[subpage_idx % len(slot)]
+    if min_subpage_dwell <= 0.0:
+        # Fast path: original behaviour, no dwell tracking needed.
+        for subpage_idx in range(max_subpages):
+            for slot in slots:
+                yield slot[subpage_idx % len(slot)]
+        return
+
+    # Dwell path: each slot tracks its own current sub-page index and the
+    # monotonic time at which that sub-page was first shown.
+    # current_subpage[i]  — index of the active sub-page within slot i
+    # first_shown[i]      — time.monotonic() when that sub-page was first yielded
+    current_subpage = [0] * len(slots)
+    first_shown = [None] * len(slots)
+
+    # Run until every slot has fully advanced through all its sub-pages.
+    # A slot is "done" once it has been shown at subpage index len(slot)-1
+    # and its dwell has expired (i.e. current_subpage would advance past the end).
+    done = [False] * len(slots)
+
+    while not all(done):
+        for i, slot in enumerate(slots):
+            now = time.monotonic()
+
+            # Record when this sub-page was first shown.
+            if first_shown[i] is None:
+                first_shown[i] = now
+
+            yield slot[current_subpage[i]]
+
+            # Advance to the next sub-page once the dwell has elapsed.
+            elapsed = now - first_shown[i]
+            if elapsed >= min_subpage_dwell and not done[i]:
+                next_idx = current_subpage[i] + 1
+                if next_idx >= len(slot):
+                    done[i] = True
+                else:
+                    current_subpage[i] = next_idx
+                    first_shown[i] = None  # reset; will be stamped on next yield
 
 
 def _group_pages_into_slots(pages):
@@ -326,7 +382,7 @@ def _group_pages_into_slots(pages):
 
 def restream(input_file, mask, time_format, loop, output=None,
              interleave=False, magazine_parallel=False, vbi_lines=8,
-             control_overrides=None):
+             control_overrides=None, min_subpage_dwell=0.0):
     """
     Read *input_file* packet-by-packet and write every packet to *output*
     (defaults to sys.stdout.buffer), rewriting header packets with the
@@ -346,6 +402,9 @@ def restream(input_file, mask, time_format, loop, output=None,
                            Low-traffic magazines may share a line.
         vbi_lines: total VBI lines to distribute across magazines (default 8)
         control_overrides: optional dict mapping control names (C4-C11) to 0/1
+        min_subpage_dwell: minimum seconds a sub-page must be shown before
+                           advancing to the next one (default 0; disabled).
+                           Applies to interleave and magazine_parallel modes.
     """
     if len(mask) != HEADER_TEXT_LEN:
         raise ValueError(
@@ -360,12 +419,12 @@ def restream(input_file, mask, time_format, loop, output=None,
 
     if interleave:
         _restream_interleaved(input_file, mask, time_format, loop, output,
-                              vbi_lines, control_overrides)
+                              vbi_lines, control_overrides, min_subpage_dwell)
         return
 
     if magazine_parallel:
         _restream_magazine_parallel(input_file, mask, time_format, loop, output,
-                                    vbi_lines, control_overrides)
+                                    vbi_lines, control_overrides, min_subpage_dwell)
         return
 
     with open(input_file, 'rb') as f:
@@ -401,7 +460,8 @@ def restream(input_file, mask, time_format, loop, output=None,
 
 
 def _restream_interleaved(input_file, mask, time_format, loop, output,
-                          vbi_lines=8, control_overrides=None):
+                          vbi_lines=8, control_overrides=None,
+                          min_subpage_dwell=0.0):
     """
     Emit packets from *input_file* interleaved round-robin by magazine.
 
@@ -428,7 +488,7 @@ def _restream_interleaved(input_file, mask, time_format, loop, output,
         # know when we cross a field boundary.
         packets_in_field = 0
 
-        for page_packets in _interleave_pages(pages_by_mag):
+        for page_packets in _interleave_pages(pages_by_mag, min_subpage_dwell):
             magazine, _ = _parse_packet_address(page_packets[0])
 
             # Pad to the next field boundary before the header so the header
@@ -506,8 +566,14 @@ def _next_packet_for_mag(mag, state_by_mag, slots_by_mag):
 
 
 def _advance_mag_state(mag, state_by_mag, slots_by_mag,
-                       active_magazines, cycle_count_by_mag, max_cycles, loop):
-    """Advance the cursor for *mag* after one packet has been emitted."""
+                       active_magazines, cycle_count_by_mag, max_cycles, loop,
+                       min_subpage_dwell=0.0):
+    """Advance the cursor for *mag* after one packet has been emitted.
+
+    When min_subpage_dwell > 0, the sub-page index is only incremented once at
+    least min_subpage_dwell seconds have elapsed since the header of the current
+    sub-page was first emitted.  Until then the same sub-page is repeated.
+    """
     state = state_by_mag[mag]
     slots = slots_by_mag[mag]
     slot = slots[state['slot']]
@@ -522,7 +588,21 @@ def _advance_mag_state(mag, state_by_mag, slots_by_mag,
     if state['slot'] < len(slots):
         return
 
+    # Completed all slots for this sub-page round.  With dwell enabled, only
+    # advance to the next sub-page if the dwell has elapsed.
     state['slot'] = 0
+
+    if min_subpage_dwell > 0.0:
+        now = time.monotonic()
+        if state.get('subpage_first_shown') is None:
+            state['subpage_first_shown'] = now
+        elapsed = now - state['subpage_first_shown']
+        if elapsed < min_subpage_dwell:
+            # Dwell not yet expired — stay on the current sub-page.
+            return
+        # Dwell expired; clear the clock so the next sub-page starts fresh.
+        state['subpage_first_shown'] = None
+
     state['subpage'] += 1
 
     if all(state['subpage'] >= len(s) for s in slots):
@@ -533,7 +613,8 @@ def _advance_mag_state(mag, state_by_mag, slots_by_mag,
 
 
 def _restream_magazine_parallel(input_file, mask, time_format, loop, output,
-                                 vbi_lines=8, control_overrides=None):
+                                 vbi_lines=8, control_overrides=None,
+                                 min_subpage_dwell=0.0):
     """
     Emit packets proportionally by magazine page count across available VBI
     lines using deficit round-robin (DRR) scheduling.
@@ -623,7 +704,7 @@ def _restream_magazine_parallel(input_file, mask, time_format, loop, output,
                 output.flush()
                 _advance_mag_state(chosen, state_by_mag, slots_by_mag,
                                    active_magazines, cycle_count_by_mag,
-                                   max_cycles, loop)
+                                   max_cycles, loop, min_subpage_dwell)
 
         if not loop:
             break
@@ -663,6 +744,7 @@ def main():
     magazine_parallel = False
     vbi_lines = 8
     control_overrides = {}
+    min_subpage_dwell = 0.0
 
     i = 2
     while i < len(sys.argv):
@@ -712,6 +794,19 @@ def main():
                 sys.exit(1)
             control_overrides[control_name] = control_value
             i += 2
+        elif arg == "--min-subpage-dwell":
+            if i + 1 >= len(sys.argv):
+                print("Error: --min-subpage-dwell requires an argument", file=sys.stderr)
+                sys.exit(1)
+            try:
+                min_subpage_dwell = float(sys.argv[i + 1])
+                if min_subpage_dwell < 0:
+                    print("Error: --min-subpage-dwell must be >= 0", file=sys.stderr)
+                    sys.exit(1)
+            except ValueError:
+                print("Error: --min-subpage-dwell argument must be a number", file=sys.stderr)
+                sys.exit(1)
+            i += 2
         else:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
             sys.exit(1)
@@ -723,7 +818,8 @@ def main():
     try:
         restream(input_file, mask, time_format, loop,
                  interleave=interleave, magazine_parallel=magazine_parallel,
-                 vbi_lines=vbi_lines, control_overrides=control_overrides)
+                 vbi_lines=vbi_lines, control_overrides=control_overrides,
+                 min_subpage_dwell=min_subpage_dwell)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

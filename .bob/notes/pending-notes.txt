@@ -1,0 +1,5 @@
+{"id":"a8fb21b8-4272-419c-8281-78857ccad7aa","ts":"2026-07-21T13:18:58.331Z","path":"/Users/martinnoble/development/personal/t42parser/t42parser.md","version":"1.0.0","taskID":"cd04be86-ea9a-471c-958c-6e3148a454f3"}
+{"id":"67e67d4a-77fe-4a44-ac86-3f6206f0e386","ts":"2026-07-21T13:19:18.869Z","path":"/Users/martinnoble/development/personal/t42parser/t42restream.md","version":"1.0.0","taskID":"cd04be86-ea9a-471c-958c-6e3148a454f3"}
+{"id":"e2f259bf-d127-46fd-8b12-67e170eef0f5","ts":"2026-07-21T13:19:49.008Z","path":"/Users/martinnoble/development/personal/t42parser/technical-details.md","version":"1.0.0","taskID":"cd04be86-ea9a-471c-958c-6e3148a454f3"}
+{"id":"c9dc6966-eaf8-425e-919a-d215ef37ac78","ts":"2026-07-21T13:20:10.420Z","path":"/Users/martinnoble/development/personal/t42parser/README.md","version":"1.0.0","taskID":"cd04be86-ea9a-471c-958c-6e3148a454f3"}
+{"id":"86510c4f-5307-4b6a-9f19-f7cff8ca5be7","ts":"2026-07-21T13:28:38.599Z","path":"/Users/martinnoble/development/personal/t42parser/AGENTS.md","version":"1.0.0","taskID":"13b11c62-9c40-4164-8681-7ba9c06d1f16"}

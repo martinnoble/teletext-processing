@@ -1,0 +1,42 @@
+
+================================================================================
+ERROR LOGGED: 2026-07-21T13:14:46.050Z
+================================================================================
+Error Name: Error
+Error Message: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+
+Stack Trace:
+Error: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+    at Lcr (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:7157)
+    at async Ixe.connect (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:13137)
+    at async file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:17293
+================================================================================
+
+
+================================================================================
+ERROR LOGGED: 2026-07-21T13:22:12.234Z
+================================================================================
+Error Name: Error
+Error Message: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+
+Stack Trace:
+Error: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+    at Lcr (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:7157)
+    at async Ixe.connect (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:13137)
+    at async file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:17293
+================================================================================
+
+
+================================================================================
+ERROR LOGGED: 2026-07-21T13:25:11.526Z
+================================================================================
+Error Name: Error
+Error Message: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+
+Stack Trace:
+Error: 401 error received for SSE server 'adobe-aem-content' without OAuth configuration. Please authenticate using: /mcp auth adobe-aem-content
+    at Lcr (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:7157)
+    at async Ixe.connect (file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:13137)
+    at async file:///Users/martinnoble/.nvm/versions/node/v26.5.0/lib/node_modules/bobshell/bundle/bob.js:3480:17293
+================================================================================
+
