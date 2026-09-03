@@ -69,6 +69,10 @@ import time
 
 from teletext_helpers import hamming_8_4_decode, hamming_8_4_encode, encode_text_byte
 
+__all__ = [
+    'restream',
+]
+
 PACKET_SIZE = 42
 # Header text occupies packet bytes 10-41 (32 characters shown on screen)
 HEADER_TEXT_START = 10

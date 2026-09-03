@@ -5,6 +5,17 @@ Teletext Helper Functions
 Common utility functions for processing Teletext data.
 """
 
+__all__ = [
+    'hamming_8_4_decode',
+    'hamming_8_4_decode_checked',
+    'hamming_8_4_encode',
+    'encode_text_byte',
+    'decode_text_bytes',
+    'decode_text_bytes_checked',
+    'calculate_page_crc',
+]
+
+
 def hamming_8_4_decode(byte):
     """
     Decode a Hamming 8/4 encoded byte according to Teletext specification.

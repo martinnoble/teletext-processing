@@ -8,6 +8,16 @@ Each packet is 42 bytes (45 bytes minus the first 3 bytes of clock run-in and fr
 
 from teletext_helpers import hamming_8_4_decode, hamming_8_4_decode_checked, decode_text_bytes, decode_text_bytes_checked, calculate_page_crc
 
+__all__ = [
+    'parse_packet_header',
+    'decode_page_header',
+    'decode_packet_27',
+    'decode_data_packet',
+    'analyze_page_statistics',
+    'process_t42_file',
+    'compare_packets',
+]
+
 
 def parse_packet_header(packet_data):
     """
